@@ -200,7 +200,7 @@ class TokenLogger:
             self.host_log_file = self.host_log_dir / f"token_correlation_{timestamp}.csv"
             self.host_server_log_file = self.host_log_dir / f"server_logs_{timestamp}.txt"
         
-        # CSV 헤더에 모든 서버 메트릭 추가
+        # CSV 헤더 - 실제로 사용되는 필드들만 포함
         self.fieldnames = [
             'timestamp',
             'conversation_id', 
@@ -212,13 +212,6 @@ class TokenLogger:
             'history_tokens',
             'question_tokens',
             'approx_cached_percent',
-            'actual_cache_hit_rate',
-            'prompt_throughput',
-            'generation_throughput',
-            'gpu_kv_cache_usage',
-            'running_requests',
-            'waiting_requests',
-            'engine_id',
             'ttft_ms',
             'tpot_ms',
             'latency_ms'
@@ -477,7 +470,7 @@ class TokenLogger:
         return list(self.log_buffer)[-count:]
     
     def log_request(self, request_stats: RequestStats, history_tokens: int, question_tokens: int) -> None:
-        """각 요청의 토큰 정보와 모든 서버 메트릭을 로그 파일에 기록"""
+        """각 요청의 토큰 정보를 로그 파일에 기록"""
         log_entry = {
             'timestamp': datetime.now().isoformat(),
             'conversation_id': request_stats.conversation_id,
@@ -489,13 +482,6 @@ class TokenLogger:
             'history_tokens': history_tokens,
             'question_tokens': question_tokens,
             'approx_cached_percent': request_stats.approx_cached_percent,
-            'actual_cache_hit_rate': self.latest_cache_hit_rate,
-            'prompt_throughput': self.latest_prompt_throughput,
-            'generation_throughput': self.latest_generation_throughput,
-            'gpu_kv_cache_usage': self.latest_gpu_kv_cache_usage,
-            'running_requests': self.latest_running_requests,
-            'waiting_requests': self.latest_waiting_requests,
-            'engine_id': self.latest_engine_id,
             'ttft_ms': request_stats.ttft_ms,
             'tpot_ms': request_stats.tpot_ms,
             'latency_ms': request_stats.latency_ms
