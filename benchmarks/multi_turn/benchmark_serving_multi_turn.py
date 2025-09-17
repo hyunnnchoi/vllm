@@ -172,14 +172,33 @@ class MovingAverage:
 
 
 class TokenLogger:
-    def __init__(self, log_dir: str = "logs") -> None:
+    def __init__(self, log_dir: str = "logs", host_log_dir: Optional[str] = None) -> None:
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(exist_ok=True)
+        
+        # 호스트 로그 디렉토리 설정 (컨테이너 외부)
+        self.host_log_dir = None
+        self.host_log_file = None
+        self.host_server_log_file = None
+        
+        if host_log_dir:
+            self.host_log_dir = Path(host_log_dir)
+            try:
+                self.host_log_dir.mkdir(parents=True, exist_ok=True)
+                logger.info(f"{Color.GREEN}Host log directory created: {self.host_log_dir}{Color.RESET}")
+            except Exception as e:
+                logger.warning(f"{Color.YELLOW}Failed to create host log directory {host_log_dir}: {e}{Color.RESET}")
+                self.host_log_dir = None
         
         # 타임스탬프가 포함된 파일명 생성
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.log_file = self.log_dir / f"token_correlation_{timestamp}.csv"
         self.server_log_file = self.log_dir / f"server_logs_{timestamp}.txt"
+        
+        # 호스트 파일 경로 설정
+        if self.host_log_dir:
+            self.host_log_file = self.host_log_dir / f"token_correlation_{timestamp}.csv"
+            self.host_server_log_file = self.host_log_dir / f"server_logs_{timestamp}.txt"
         
         # CSV 헤더에 모든 서버 메트릭 추가
         self.fieldnames = [
@@ -216,16 +235,33 @@ class TokenLogger:
         self.log_monitor_thread = None
         self.log_buffer = deque(maxlen=1000)  # 최근 1000개 로그 라인 저장
         
+        # 컨테이너 내부 파일 생성
         with open(self.log_file, 'w', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=self.fieldnames)
             writer.writeheader()
             
-        # 서버 로그 파일 생성
         with open(self.server_log_file, 'w', encoding='utf-8') as f:
             f.write(f"Server logs started at {datetime.now().isoformat()}\n")
+        
+        # 호스트 파일 생성 (있는 경우)
+        if self.host_log_file:
+            try:
+                with open(self.host_log_file, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+                    writer.writeheader()
+                    
+                with open(self.host_server_log_file, 'w', encoding='utf-8') as f:
+                    f.write(f"Server logs started at {datetime.now().isoformat()}\n")
+                    
+                logger.info(f"{Color.GREEN}Host token correlation log: {self.host_log_file}{Color.RESET}")
+                logger.info(f"{Color.GREEN}Host server logs: {self.host_server_log_file}{Color.RESET}")
+            except Exception as e:
+                logger.warning(f"{Color.YELLOW}Failed to create host log files: {e}{Color.RESET}")
+                self.host_log_file = None
+                self.host_server_log_file = None
             
-        logger.info(f"{Color.GREEN}Token correlation log will be saved to: {self.log_file}{Color.RESET}")
-        logger.info(f"{Color.GREEN}Server logs will be saved to: {self.server_log_file}{Color.RESET}")
+        logger.info(f"{Color.GREEN}Container token correlation log: {self.log_file}{Color.RESET}")
+        logger.info(f"{Color.GREEN}Container server logs: {self.server_log_file}{Color.RESET}")
         
         # 서버 로그 모니터링 시작
         self.start_log_monitoring()
@@ -288,12 +324,21 @@ class TokenLogger:
         # 로그 라인을 버퍼에 저장
         self.log_buffer.append(f"{datetime.now().isoformat()}: {line}")
         
-        # 서버 로그 파일에도 저장
+        # 서버 로그 파일에 저장 (컨테이너 + 호스트)
+        log_line = f"{datetime.now().isoformat()}: {line}\n"
         try:
             with open(self.server_log_file, 'a', encoding='utf-8') as f:
-                f.write(f"{datetime.now().isoformat()}: {line}\n")
+                f.write(log_line)
         except Exception:
-            pass  # 파일 쓰기 실패해도 메인 기능에 영향 주지 않음
+            pass
+            
+        # 호스트 서버 로그 파일에도 저장
+        if self.host_server_log_file:
+            try:
+                with open(self.host_server_log_file, 'a', encoding='utf-8') as f:
+                    f.write(log_line)
+            except Exception:
+                pass
         
         # 전체 Engine 로그 파싱 (예: Engine 000: Avg prompt throughput: 360.2 tokens/s, ...)
         engine_pattern = r'Engine\s+(\d+):\s+Avg prompt throughput:\s*([\d.]+)\s*tokens/s,\s*Avg generation throughput:\s*([\d.]+)\s*tokens/s,\s*Running:\s*(\d+)\s*reqs,\s*Waiting:\s*(\d+)\s*reqs,\s*GPU KV cache usage:\s*([\d.]+)%,\s*Prefix cache hit rate:\s*([\d.]+)%'
@@ -373,9 +418,22 @@ class TokenLogger:
             'latency_ms': request_stats.latency_ms
         }
         
+        # 컨테이너 내부 CSV 파일에 저장
         with open(self.log_file, 'a', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=self.fieldnames)
             writer.writerow(log_entry)
+            
+        # 호스트 CSV 파일에도 저장
+        if self.host_log_file:
+            try:
+                with open(self.host_log_file, 'a', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+                    writer.writerow(log_entry)
+            except Exception as e:
+                # 첫 번째 실패 시에만 로그 (스팸 방지)
+                if not hasattr(self, '_host_write_failed'):
+                    logger.warning(f"{Color.YELLOW}Failed to write to host CSV: {e}{Color.RESET}")
+                    self._host_write_failed = True
 
 
 class DebugStats:
@@ -1086,6 +1144,7 @@ async def main_mp(
     tokenizer: AutoTokenizer,
     input_conv: ConversationsMap,
     enable_token_logging: bool = False,
+    host_log_dir: Optional[str] = None,
 ) -> tuple[ConversationsMap, list[RequestStats]]:
     # An event that will trigger graceful termination of all the clients
     stop_event = mp.Event()
@@ -1104,7 +1163,14 @@ async def main_mp(
     # 토큰 로거 초기화 (필요한 경우)
     token_logger = None
     if enable_token_logging:
-        token_logger = TokenLogger()
+        # 호스트 로그 디렉토리 준비
+        actual_host_log_dir = None
+        if host_log_dir:
+            # 벤치마크별 서브디렉토리 생성
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            actual_host_log_dir = f"{host_log_dir}/vllm_benchmark_logs_{timestamp}"
+            
+        token_logger = TokenLogger(host_log_dir=actual_host_log_dir)
 
     # Start all clients
     start_time = time.perf_counter_ns()
@@ -1658,6 +1724,13 @@ async def main() -> None:
         action="store_true",
         help="Enable detailed conversation debugging and validation",
     )
+    
+    parser.add_argument(
+        "--host-log-dir",
+        type=str,
+        default=None,
+        help="Host directory to save logs (outside container). Creates subdirectory if needed.",
+    )
 
     args = parser.parse_args()
 
@@ -1807,14 +1880,14 @@ async def main() -> None:
 
         logger.info(f"{Color.PURPLE}Warmup start{Color.RESET}")
         conversations, _ = await main_mp(
-            warmup_client_args, req_args, warmup_bench_args, tokenizer, conversations, False
+            warmup_client_args, req_args, warmup_bench_args, tokenizer, conversations, False, args.host_log_dir
         )
         logger.info(f"{Color.PURPLE}Warmup done{Color.RESET}")
 
     # Run the benchmark
     start_time = time.perf_counter_ns()
     client_convs, client_metrics = await main_mp(
-        client_args, req_args, bench_args, tokenizer, conversations, args.log_token_correlation
+        client_args, req_args, bench_args, tokenizer, conversations, args.log_token_correlation, args.host_log_dir
     )
     total_runtime_ms = nanosec_to_millisec(time.perf_counter_ns() - start_time)
 
