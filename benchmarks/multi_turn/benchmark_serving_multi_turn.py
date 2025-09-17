@@ -855,10 +855,30 @@ async def client_main(
             turns_count[conv_id] += 1
             current_turn = turns_count[conv_id]
 
-            assert current_turn < len(messages), (
-                f"Turn number {current_turn} is invalid for conversation ID {conv_id}"
-                f" that has only {len(messages)} messages"
-            )
+            # 대화 유효성 검사 및 디버깅 정보
+            if current_turn >= len(messages):
+                logger.warning(
+                    f"{Color.YELLOW}Client {client_id} - Invalid turn {current_turn} for conversation {conv_id} "
+                    f"with {len(messages)} messages. Removing conversation.{Color.RESET}"
+                )
+                if args.verbose:
+                    logger.info(f"Messages in conversation {conv_id}: {[msg.get('role', 'unknown') for msg in messages]}")
+                
+                # 문제가 있는 대화를 active_convs에서 제거
+                if conv_id in active_convs:
+                    active_convs.pop(conv_id)
+                    logger.info(f"{Color.YELLOW}Removed invalid conversation {conv_id} from active conversations{Color.RESET}")
+                continue
+
+            # 추가 검증: 현재 턴이 user 메시지인지 확인
+            if current_turn > 0 and current_turn - 1 < len(messages):
+                expected_role = "user" if (current_turn - 1) % 2 == 0 else "assistant"
+                actual_role = messages[current_turn - 1].get("role", "unknown")
+                if actual_role != expected_role:
+                    logger.warning(
+                        f"{Color.YELLOW}Client {client_id} - Role mismatch in conversation {conv_id} "
+                        f"at turn {current_turn - 1}: expected {expected_role}, got {actual_role}{Color.RESET}"
+                    )
 
             if args.verbose:
                 curr_time_sec: float = time.perf_counter()
@@ -1631,6 +1651,13 @@ async def main() -> None:
         action="store_true",
         help="Enable logging of input/output token correlation to CSV file in logs/ directory",
     )
+    
+    parser.add_argument(
+        "--debug-conversations",
+        default=False,
+        action="store_true",
+        help="Enable detailed conversation debugging and validation",
+    )
 
     args = parser.parse_args()
 
@@ -1721,6 +1748,41 @@ async def main() -> None:
             f"{Color.PURPLE}Max turns per conversation "
             f"is limited to {args.max_turns}{Color.RESET}"
         )
+
+    # 대화 데이터 검증 및 정리
+    logger.info(f"Validating {len(conversations)} conversations...")
+    valid_conversations = {}
+    invalid_count = 0
+    
+    for conv_id, messages in conversations.items():
+        # 최소 1개 이상의 메시지 필요
+        if len(messages) < 1:
+            invalid_count += 1
+            logger.warning(f"Conversation {conv_id} has no messages, skipping")
+            continue
+            
+        # 홀수 개의 메시지 체크 (마지막이 user 메시지여야 함)
+        if len(messages) % 2 == 0:
+            if args.debug_conversations:
+                logger.warning(f"Conversation {conv_id} has even number of messages ({len(messages)}), may cause issues")
+            
+        # 첫 번째 메시지가 user인지 확인
+        if messages[0].get("role") != "user":
+            if args.debug_conversations:
+                logger.warning(f"Conversation {conv_id} doesn't start with user message: {messages[0].get('role')}")
+        
+        # 상세 디버깅 정보
+        if args.debug_conversations and len(messages) <= 3:
+            roles = [msg.get('role', 'unknown') for msg in messages]
+            logger.info(f"Conversation {conv_id}: {len(messages)} messages with roles: {roles}")
+            
+        valid_conversations[conv_id] = messages
+    
+    if invalid_count > 0:
+        logger.warning(f"Removed {invalid_count} invalid conversations")
+        
+    conversations = valid_conversations
+    logger.info(f"Using {len(conversations)} valid conversations for benchmarking")
 
     # Create benchmark configurations
     client_args, req_args = get_client_config(args, conversations)
