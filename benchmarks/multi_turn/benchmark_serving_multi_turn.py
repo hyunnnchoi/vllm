@@ -8,6 +8,9 @@ import logging
 import multiprocessing as mp
 import os
 import random
+import re
+import subprocess
+import threading
 import time
 from collections import Counter, deque
 from datetime import datetime
@@ -176,8 +179,9 @@ class TokenLogger:
         # 타임스탬프가 포함된 파일명 생성
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.log_file = self.log_dir / f"token_correlation_{timestamp}.csv"
+        self.server_log_file = self.log_dir / f"server_logs_{timestamp}.txt"
         
-        # CSV 헤더 작성
+        # CSV 헤더에 실제 캐시 적중률 추가
         self.fieldnames = [
             'timestamp',
             'conversation_id', 
@@ -189,19 +193,127 @@ class TokenLogger:
             'history_tokens',
             'question_tokens',
             'approx_cached_percent',
+            'actual_cache_hit_rate',
+            'prompt_throughput',
+            'generation_throughput',
+            'gpu_kv_cache_usage',
             'ttft_ms',
             'tpot_ms',
             'latency_ms'
         ]
         
+        # 서버 로그 모니터링을 위한 변수
+        self.latest_cache_hit_rate = None
+        self.latest_prompt_throughput = None
+        self.latest_generation_throughput = None
+        self.latest_gpu_kv_cache_usage = None
+        self.log_monitor_thread = None
+        self.log_buffer = deque(maxlen=1000)  # 최근 1000개 로그 라인 저장
+        
         with open(self.log_file, 'w', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=self.fieldnames)
             writer.writeheader()
             
+        # 서버 로그 파일 생성
+        with open(self.server_log_file, 'w', encoding='utf-8') as f:
+            f.write(f"Server logs started at {datetime.now().isoformat()}\n")
+            
         logger.info(f"{Color.GREEN}Token correlation log will be saved to: {self.log_file}{Color.RESET}")
+        logger.info(f"{Color.GREEN}Server logs will be saved to: {self.server_log_file}{Color.RESET}")
+        
+        # 서버 로그 모니터링 시작
+        self.start_log_monitoring()
+    
+    def start_log_monitoring(self):
+        """서버 로그를 모니터링해서 캐시 적중률과 성능 메트릭 추출"""
+        def monitor_logs():
+            try:
+                # journalctl을 사용해서 현재 프로세스의 로그 모니터링
+                # 일반적으로 vLLM 서버는 stdout으로 로그를 출력
+                cmd = ["journalctl", "-f", "--no-pager", "-t", "python3"]
+                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, 
+                                         stderr=subprocess.STDOUT, text=True, bufsize=1)
+                
+                for line in iter(process.stdout.readline, ''):
+                    line = line.strip()
+                    if line:
+                        self.parse_server_log(line)
+                        
+            except (subprocess.SubprocessError, FileNotFoundError):
+                # journalctl이 없거나 권한이 없는 경우 폴백
+                logger.warning("journalctl monitoring failed, trying alternative methods")
+                self.monitor_docker_logs()
+        
+        self.log_monitor_thread = threading.Thread(target=monitor_logs, daemon=True)
+        self.log_monitor_thread.start()
+    
+    def monitor_docker_logs(self):
+        """Docker 컨테이너 로그 모니터링 (폴백 방법)"""
+        try:
+            # 현재 실행 중인 컨테이너들 확인
+            result = subprocess.run(["docker", "ps", "--format", "{{.Names}}"], 
+                                  capture_output=True, text=True)
+            container_names = result.stdout.strip().split('\n')
+            
+            # vLLM 관련 컨테이너 찾기
+            vllm_container = None
+            for name in container_names:
+                if any(keyword in name.lower() for keyword in ['vllm', 'llm', 'model']):
+                    vllm_container = name
+                    break
+            
+            if vllm_container:
+                cmd = ["docker", "logs", "-f", "--tail", "100", vllm_container]
+                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, 
+                                         stderr=subprocess.STDOUT, text=True, bufsize=1)
+                
+                for line in iter(process.stdout.readline, ''):
+                    line = line.strip()
+                    if line:
+                        self.parse_server_log(line)
+            else:
+                logger.warning("No vLLM container found for log monitoring")
+                
+        except Exception as e:
+            logger.warning(f"Docker log monitoring failed: {e}")
+    
+    def parse_server_log(self, line: str):
+        """서버 로그에서 캐시 적중률과 성능 메트릭 정보 추출"""
+        # 로그 라인을 버퍼에 저장
+        self.log_buffer.append(f"{datetime.now().isoformat()}: {line}")
+        
+        # 서버 로그 파일에도 저장
+        try:
+            with open(self.server_log_file, 'a', encoding='utf-8') as f:
+                f.write(f"{datetime.now().isoformat()}: {line}\n")
+        except Exception:
+            pass  # 파일 쓰기 실패해도 메인 기능에 영향 주지 않음
+        
+        # Prefix cache hit rate 추출
+        cache_match = re.search(r'Prefix cache hit rate:\s*([\d.]+)%', line)
+        if cache_match:
+            self.latest_cache_hit_rate = float(cache_match.group(1))
+        
+        # Throughput 정보 추출
+        throughput_match = re.search(
+            r'Avg prompt throughput:\s*([\d.]+)\s*tokens/s,\s*Avg generation throughput:\s*([\d.]+)\s*tokens/s', 
+            line
+        )
+        if throughput_match:
+            self.latest_prompt_throughput = float(throughput_match.group(1))
+            self.latest_generation_throughput = float(throughput_match.group(2))
+        
+        # GPU KV cache usage 추출
+        gpu_cache_match = re.search(r'GPU KV cache usage:\s*([\d.]+)%', line)
+        if gpu_cache_match:
+            self.latest_gpu_kv_cache_usage = float(gpu_cache_match.group(1))
+    
+    def get_recent_logs(self, count: int = 50) -> list[str]:
+        """최근 로그 라인들을 반환"""
+        return list(self.log_buffer)[-count:]
     
     def log_request(self, request_stats: RequestStats, history_tokens: int, question_tokens: int) -> None:
-        """각 요청의 토큰 정보를 로그 파일에 기록"""
+        """각 요청의 토큰 정보와 실제 캐시 적중률을 로그 파일에 기록"""
         log_entry = {
             'timestamp': datetime.now().isoformat(),
             'conversation_id': request_stats.conversation_id,
@@ -213,6 +325,10 @@ class TokenLogger:
             'history_tokens': history_tokens,
             'question_tokens': question_tokens,
             'approx_cached_percent': request_stats.approx_cached_percent,
+            'actual_cache_hit_rate': self.latest_cache_hit_rate,
+            'prompt_throughput': self.latest_prompt_throughput,
+            'generation_throughput': self.latest_generation_throughput,
+            'gpu_kv_cache_usage': self.latest_gpu_kv_cache_usage,
             'ttft_ms': request_stats.ttft_ms,
             'tpot_ms': request_stats.tpot_ms,
             'latency_ms': request_stats.latency_ms
