@@ -2,16 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
 import asyncio
+import csv
 import json
 import logging
 import multiprocessing as mp
 import os
 import random
+import re
+import subprocess
+import threading
 import time
 from collections import Counter, deque
 from datetime import datetime
 from enum import Enum
 from http import HTTPStatus
+from pathlib import Path
 from statistics import mean
 from typing import NamedTuple, Optional, Union
 
@@ -164,6 +169,340 @@ class MovingAverage:
         if self.count == 0:
             return "no data"
         return f"avg: {self.avg:>10.3f} ({self.count} samples)"
+
+
+class TokenLogger:
+    def __init__(self, log_dir: str = "logs", host_log_dir: Optional[str] = None, simulate_metrics: bool = False) -> None:
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(exist_ok=True)
+        
+        # 호스트 로그 디렉토리 설정 (컨테이너 외부)
+        self.host_log_dir = None
+        self.host_log_file = None
+        self.host_server_log_file = None
+        
+        if host_log_dir:
+            self.host_log_dir = Path(host_log_dir)
+            try:
+                self.host_log_dir.mkdir(parents=True, exist_ok=True)
+                logger.info(f"{Color.GREEN}Host log directory created: {self.host_log_dir}{Color.RESET}")
+            except Exception as e:
+                logger.warning(f"{Color.YELLOW}Failed to create host log directory {host_log_dir}: {e}{Color.RESET}")
+                self.host_log_dir = None
+        
+        # 타임스탬프가 포함된 파일명 생성
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_file = self.log_dir / f"token_correlation_{timestamp}.csv"
+        self.server_log_file = self.log_dir / f"server_logs_{timestamp}.txt"
+        
+        # 호스트 파일 경로 설정
+        if self.host_log_dir:
+            self.host_log_file = self.host_log_dir / f"token_correlation_{timestamp}.csv"
+            self.host_server_log_file = self.host_log_dir / f"server_logs_{timestamp}.txt"
+        
+        # CSV 헤더 - 실제로 사용되는 필드들만 포함
+        self.fieldnames = [
+            'timestamp',
+            'conversation_id', 
+            'client_id',
+            'turn_number',
+            'input_num_tokens',
+            'output_num_tokens',
+            'input_num_turns',
+            'history_tokens',
+            'question_tokens',
+            'approx_cached_percent',
+            'ttft_ms',
+            'tpot_ms',
+            'latency_ms'
+        ]
+        
+        # 서버 로그 모니터링을 위한 변수
+        self.latest_cache_hit_rate = None
+        self.latest_prompt_throughput = None
+        self.latest_generation_throughput = None
+        self.latest_gpu_kv_cache_usage = None
+        self.latest_running_requests = None
+        self.latest_waiting_requests = None
+        self.latest_engine_id = None
+        self.log_monitor_thread = None
+        self.log_buffer = deque(maxlen=1000)  # 최근 1000개 로그 라인 저장
+        self.simulate_metrics = simulate_metrics
+        
+        # 컨테이너 내부 파일 생성
+        with open(self.log_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            writer.writeheader()
+            
+        with open(self.server_log_file, 'w', encoding='utf-8') as f:
+            f.write(f"Server logs started at {datetime.now().isoformat()}\n")
+        
+        # 호스트 파일 생성 (있는 경우)
+        if self.host_log_file:
+            try:
+                with open(self.host_log_file, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+                    writer.writeheader()
+                    
+                with open(self.host_server_log_file, 'w', encoding='utf-8') as f:
+                    f.write(f"Server logs started at {datetime.now().isoformat()}\n")
+                    
+                logger.info(f"{Color.GREEN}Host token correlation log: {self.host_log_file}{Color.RESET}")
+                logger.info(f"{Color.GREEN}Host server logs: {self.host_server_log_file}{Color.RESET}")
+            except Exception as e:
+                logger.warning(f"{Color.YELLOW}Failed to create host log files: {e}{Color.RESET}")
+                self.host_log_file = None
+                self.host_server_log_file = None
+            
+        logger.info(f"{Color.GREEN}Container token correlation log: {self.log_file}{Color.RESET}")
+        logger.info(f"{Color.GREEN}Container server logs: {self.server_log_file}{Color.RESET}")
+        
+        # 서버 로그 모니터링 시작
+        if self.simulate_metrics:
+            logger.info(f"{Color.YELLOW}Using simulated server metrics for testing{Color.RESET}")
+            self.setup_simulated_metrics()
+        else:
+            self.start_log_monitoring()
+    
+    def start_log_monitoring(self):
+        """서버 로그를 모니터링해서 캐시 적중률과 성능 메트릭 추출"""
+        def monitor_logs():
+            # 여러 방법을 순차적으로 시도
+            methods = [
+                self.monitor_vllm_api_logs,
+                self.monitor_stdout_logs,
+                self.monitor_docker_logs,
+                self.monitor_journalctl_logs
+            ]
+            
+            for method in methods:
+                try:
+                    logger.info(f"Trying log monitoring method: {method.__name__}")
+                    method()
+                    break  # 성공하면 다른 방법 시도하지 않음
+                except Exception as e:
+                    logger.warning(f"Log monitoring method {method.__name__} failed: {e}")
+                    continue
+            else:
+                logger.warning("All log monitoring methods failed. Server metrics will not be available.")
+        
+        self.log_monitor_thread = threading.Thread(target=monitor_logs, daemon=True)
+        self.log_monitor_thread.start()
+    
+    def monitor_vllm_api_logs(self):
+        """vLLM API 서버 로그를 직접 모니터링"""
+        try:
+            # vLLM 프로세스 찾기
+            result = subprocess.run(["pgrep", "-f", "vllm.entrypoints.openai.api_server"], 
+                                  capture_output=True, text=True)
+            if result.returncode == 0:
+                pid = result.stdout.strip().split('\n')[0]
+                logger.info(f"Found vLLM API server process: {pid}")
+                
+                # 프로세스 로그 모니터링 (여러 방법 시도)
+                for log_path in [f"/proc/{pid}/fd/1", f"/proc/{pid}/fd/2"]:
+                    try:
+                        cmd = ["tail", "-f", log_path]
+                        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, 
+                                                 stderr=subprocess.DEVNULL, text=True, bufsize=1)
+                        
+                        for line in iter(process.stdout.readline, ''):
+                            line = line.strip()
+                            if line and "Engine" in line:
+                                self.parse_server_log(line)
+                                
+                    except Exception:
+                        continue
+            else:
+                raise Exception("vLLM API server process not found")
+                
+        except Exception as e:
+            raise Exception(f"vLLM API log monitoring failed: {e}")
+    
+    def monitor_stdout_logs(self):
+        """표준 출력에서 로그 캡처 시도"""
+        try:
+            # 현재 터미널의 stdout 모니터링
+            cmd = ["script", "-f", "/dev/null"]
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, 
+                                     stderr=subprocess.PIPE, text=True, bufsize=1)
+            
+            for line in iter(process.stdout.readline, ''):
+                line = line.strip()
+                if line and ("Engine" in line or "tokens/s" in line):
+                    self.parse_server_log(line)
+                    
+        except Exception as e:
+            raise Exception(f"stdout monitoring failed: {e}")
+    
+    def monitor_journalctl_logs(self):
+        """journalctl을 사용한 로그 모니터링"""
+        try:
+            cmd = ["journalctl", "-f", "--no-pager", "-t", "python3"]
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, 
+                                     stderr=subprocess.STDOUT, text=True, bufsize=1)
+            
+            for line in iter(process.stdout.readline, ''):
+                line = line.strip()
+                if line:
+                    self.parse_server_log(line)
+                    
+        except Exception as e:
+            raise Exception(f"journalctl monitoring failed: {e}")
+    
+    def monitor_docker_logs(self):
+        """Docker 컨테이너 로그 모니터링 (폴백 방법)"""
+        try:
+            # 현재 실행 중인 컨테이너들 확인
+            result = subprocess.run(["docker", "ps", "--format", "{{.Names}}"], 
+                                  capture_output=True, text=True)
+            container_names = result.stdout.strip().split('\n')
+            
+            # vLLM 관련 컨테이너 찾기
+            vllm_container = None
+            for name in container_names:
+                if any(keyword in name.lower() for keyword in ['vllm', 'llm', 'model']):
+                    vllm_container = name
+                    break
+            
+            if vllm_container:
+                cmd = ["docker", "logs", "-f", "--tail", "100", vllm_container]
+                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, 
+                                         stderr=subprocess.STDOUT, text=True, bufsize=1)
+                
+                for line in iter(process.stdout.readline, ''):
+                    line = line.strip()
+                    if line:
+                        self.parse_server_log(line)
+            else:
+                logger.warning("No vLLM container found for log monitoring")
+                
+        except Exception as e:
+            logger.warning(f"Docker log monitoring failed: {e}")
+    
+    def parse_server_log(self, line: str):
+        """서버 로그에서 모든 성능 메트릭 정보 추출"""
+        # 로그 라인을 버퍼에 저장
+        self.log_buffer.append(f"{datetime.now().isoformat()}: {line}")
+        
+        # 서버 로그 파일에 저장 (컨테이너 + 호스트)
+        log_line = f"{datetime.now().isoformat()}: {line}\n"
+        try:
+            with open(self.server_log_file, 'a', encoding='utf-8') as f:
+                f.write(log_line)
+        except Exception:
+            pass
+            
+        # 호스트 서버 로그 파일에도 저장
+        if self.host_server_log_file:
+            try:
+                with open(self.host_server_log_file, 'a', encoding='utf-8') as f:
+                    f.write(log_line)
+            except Exception:
+                pass
+        
+        # 전체 Engine 로그 파싱 (예: Engine 000: Avg prompt throughput: 360.2 tokens/s, ...)
+        engine_pattern = r'Engine\s+(\d+):\s+Avg prompt throughput:\s*([\d.]+)\s*tokens/s,\s*Avg generation throughput:\s*([\d.]+)\s*tokens/s,\s*Running:\s*(\d+)\s*reqs,\s*Waiting:\s*(\d+)\s*reqs,\s*GPU KV cache usage:\s*([\d.]+)%,\s*Prefix cache hit rate:\s*([\d.]+)%'
+        
+        engine_match = re.search(engine_pattern, line)
+        if engine_match:
+            self.latest_engine_id = engine_match.group(1)
+            self.latest_prompt_throughput = float(engine_match.group(2))
+            self.latest_generation_throughput = float(engine_match.group(3))
+            self.latest_running_requests = int(engine_match.group(4))
+            self.latest_waiting_requests = int(engine_match.group(5))
+            self.latest_gpu_kv_cache_usage = float(engine_match.group(6))
+            self.latest_cache_hit_rate = float(engine_match.group(7))
+            return  # 전체 매치되면 개별 파싱은 스킵
+        
+        # 개별 메트릭 파싱 (폴백용)
+        # Prefix cache hit rate 추출
+        cache_match = re.search(r'Prefix cache hit rate:\s*([\d.]+)%', line)
+        if cache_match:
+            self.latest_cache_hit_rate = float(cache_match.group(1))
+        
+        # Throughput 정보 추출
+        throughput_match = re.search(
+            r'Avg prompt throughput:\s*([\d.]+)\s*tokens/s,\s*Avg generation throughput:\s*([\d.]+)\s*tokens/s', 
+            line
+        )
+        if throughput_match:
+            self.latest_prompt_throughput = float(throughput_match.group(1))
+            self.latest_generation_throughput = float(throughput_match.group(2))
+        
+        # GPU KV cache usage 추출
+        gpu_cache_match = re.search(r'GPU KV cache usage:\s*([\d.]+)%', line)
+        if gpu_cache_match:
+            self.latest_gpu_kv_cache_usage = float(gpu_cache_match.group(1))
+            
+        # Running requests 추출
+        running_match = re.search(r'Running:\s*(\d+)\s*reqs', line)
+        if running_match:
+            self.latest_running_requests = int(running_match.group(1))
+            
+        # Waiting requests 추출
+        waiting_match = re.search(r'Waiting:\s*(\d+)\s*reqs', line)
+        if waiting_match:
+            self.latest_waiting_requests = int(waiting_match.group(1))
+            
+        # Engine ID 추출
+        engine_id_match = re.search(r'Engine\s+(\d+):', line)
+        if engine_id_match:
+            self.latest_engine_id = engine_id_match.group(1)
+    
+    def setup_simulated_metrics(self):
+        """테스트용 시뮬레이션 메트릭 설정"""
+        import random
+        self.latest_cache_hit_rate = round(random.uniform(85.0, 95.0), 1)
+        self.latest_prompt_throughput = round(random.uniform(300.0, 600.0), 1)
+        self.latest_generation_throughput = round(random.uniform(100.0, 150.0), 1)
+        self.latest_gpu_kv_cache_usage = round(random.uniform(1.0, 5.0), 1)
+        self.latest_running_requests = random.randint(1, 8)
+        self.latest_waiting_requests = random.randint(0, 3)
+        self.latest_engine_id = "000"
+        
+        logger.info(f"Simulated metrics: cache_hit={self.latest_cache_hit_rate}%, "
+                   f"prompt_tput={self.latest_prompt_throughput}, "
+                   f"gen_tput={self.latest_generation_throughput}")
+    
+    def get_recent_logs(self, count: int = 50) -> list[str]:
+        """최근 로그 라인들을 반환"""
+        return list(self.log_buffer)[-count:]
+    
+    def log_request(self, request_stats: RequestStats, history_tokens: int, question_tokens: int) -> None:
+        """각 요청의 토큰 정보를 로그 파일에 기록"""
+        log_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'conversation_id': request_stats.conversation_id,
+            'client_id': request_stats.client_id,
+            'turn_number': request_stats.input_num_turns,
+            'input_num_tokens': request_stats.input_num_tokens,
+            'output_num_tokens': request_stats.output_num_tokens,
+            'input_num_turns': request_stats.input_num_turns,
+            'history_tokens': history_tokens,
+            'question_tokens': question_tokens,
+            'approx_cached_percent': request_stats.approx_cached_percent,
+            'ttft_ms': request_stats.ttft_ms,
+            'tpot_ms': request_stats.tpot_ms,
+            'latency_ms': request_stats.latency_ms
+        }
+        
+        # 컨테이너 내부 CSV 파일에 저장
+        with open(self.log_file, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            writer.writerow(log_entry)
+            
+        # 호스트 CSV 파일에도 저장
+        if self.host_log_file:
+            try:
+                with open(self.host_log_file, 'a', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+                    writer.writerow(log_entry)
+            except Exception as e:
+                # 첫 번째 실패 시에만 로그 (스팸 방지)
+                if not hasattr(self, '_host_write_failed'):
+                    logger.warning(f"{Color.YELLOW}Failed to write to host CSV: {e}{Color.RESET}")
+                    self._host_write_failed = True
 
 
 class DebugStats:
@@ -364,6 +703,7 @@ async def send_turn(
     req_args: RequestArgs,
     verbose: bool,
     verify_output: bool,
+    token_logger: Optional[TokenLogger] = None,
 ) -> Optional[RequestStats]:
     assert messages_to_use > 0
     assert messages_to_use <= len(conversation_messages)
@@ -480,6 +820,10 @@ async def send_turn(
         client_id=client_id,
     )
 
+    # 토큰 상관관계 로깅
+    if token_logger is not None:
+        token_logger.log_request(rs, history_num_tokens, question_num_tokens)
+
     if verbose:
         print(
             f"\n{Color.YELLOW}Response ({output_num_tokens} tokens):{Color.RESET}",
@@ -535,6 +879,7 @@ async def client_main(
     task_queue: mp.Queue,
     result_queue: mp.Queue,
     conv_queue: mp.Queue,
+    token_logger: Optional[TokenLogger] = None,
 ) -> None:
     logger.info(
         f"{Color.CYAN}Started client {client_id}: max_num_requests={args.max_num_requests}, max_active_conversations={args.max_active_conversations}{Color.RESET}"  # noqa: E501
@@ -637,10 +982,30 @@ async def client_main(
             turns_count[conv_id] += 1
             current_turn = turns_count[conv_id]
 
-            assert current_turn < len(messages), (
-                f"Turn number {current_turn} is invalid for conversation ID {conv_id}"
-                f" that has only {len(messages)} messages"
-            )
+            # 대화 유효성 검사 및 디버깅 정보
+            if current_turn >= len(messages):
+                logger.warning(
+                    f"{Color.YELLOW}Client {client_id} - Invalid turn {current_turn} for conversation {conv_id} "
+                    f"with {len(messages)} messages. Removing conversation.{Color.RESET}"
+                )
+                if args.verbose:
+                    logger.info(f"Messages in conversation {conv_id}: {[msg.get('role', 'unknown') for msg in messages]}")
+                
+                # 문제가 있는 대화를 active_convs에서 제거
+                if conv_id in active_convs:
+                    active_convs.pop(conv_id)
+                    logger.info(f"{Color.YELLOW}Removed invalid conversation {conv_id} from active conversations{Color.RESET}")
+                continue
+
+            # 추가 검증: 현재 턴이 user 메시지인지 확인
+            if current_turn > 0 and current_turn - 1 < len(messages):
+                expected_role = "user" if (current_turn - 1) % 2 == 0 else "assistant"
+                actual_role = messages[current_turn - 1].get("role", "unknown")
+                if actual_role != expected_role:
+                    logger.warning(
+                        f"{Color.YELLOW}Client {client_id} - Role mismatch in conversation {conv_id} "
+                        f"at turn {current_turn - 1}: expected {expected_role}, got {actual_role}{Color.RESET}"
+                    )
 
             if args.verbose:
                 curr_time_sec: float = time.perf_counter()
@@ -666,6 +1031,7 @@ async def client_main(
                     req_args,
                     args.print_content,
                     args.verify_output,
+                    token_logger,
                 )
                 if result is not None:
                     result_queue.put(result)
@@ -743,6 +1109,7 @@ def worker_function(
     task_queue: mp.Queue,
     result_queue: mp.Queue,
     conv_queue: mp.Queue,
+    token_logger: Optional[TokenLogger] = None,
 ) -> None:
     asyncio.run(
         client_main(
@@ -754,6 +1121,7 @@ def worker_function(
             task_queue,
             result_queue,
             conv_queue,
+            token_logger,
         )
     )
 
@@ -844,6 +1212,9 @@ async def main_mp(
     bench_args: BenchmarkArgs,
     tokenizer: AutoTokenizer,
     input_conv: ConversationsMap,
+    enable_token_logging: bool = False,
+    host_log_dir: Optional[str] = None,
+    simulate_metrics: bool = False,
 ) -> tuple[ConversationsMap, list[RequestStats]]:
     # An event that will trigger graceful termination of all the clients
     stop_event = mp.Event()
@@ -858,6 +1229,18 @@ async def main_mp(
     conv_queue: mp.Queue = mp.Queue()
     output_conv: ConversationsMap = {}
     client_metrics: list[RequestStats] = []
+
+    # 토큰 로거 초기화 (필요한 경우)
+    token_logger = None
+    if enable_token_logging:
+        # 호스트 로그 디렉토리 준비
+        actual_host_log_dir = None
+        if host_log_dir:
+            # 벤치마크별 서브디렉토리 생성
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            actual_host_log_dir = f"{host_log_dir}/vllm_benchmark_logs_{timestamp}"
+            
+        token_logger = TokenLogger(host_log_dir=actual_host_log_dir, simulate_metrics=simulate_metrics)
 
     # Start all clients
     start_time = time.perf_counter_ns()
@@ -877,6 +1260,7 @@ async def main_mp(
                 task_queue,
                 result_queue,
                 conv_queue,
+                token_logger,
             ),
         )
         clients.append(client)
@@ -1396,6 +1780,34 @@ async def main() -> None:
         " A comma separated list of percentages can be used "
         "(for example: --warmup-percentages=0%%,50%%)",
     )
+    
+    parser.add_argument(
+        "--log-token-correlation",
+        default=False,
+        action="store_true",
+        help="Enable logging of input/output token correlation to CSV file in logs/ directory",
+    )
+    
+    parser.add_argument(
+        "--debug-conversations",
+        default=False,
+        action="store_true",
+        help="Enable detailed conversation debugging and validation",
+    )
+    
+    parser.add_argument(
+        "--host-log-dir",
+        type=str,
+        default=None,
+        help="Host directory to save logs (outside container). Creates subdirectory if needed.",
+    )
+    
+    parser.add_argument(
+        "--simulate-server-metrics",
+        default=False,
+        action="store_true",
+        help="Simulate server metrics for testing (when log monitoring fails)",
+    )
 
     args = parser.parse_args()
 
@@ -1487,6 +1899,41 @@ async def main() -> None:
             f"is limited to {args.max_turns}{Color.RESET}"
         )
 
+    # 대화 데이터 검증 및 정리
+    logger.info(f"Validating {len(conversations)} conversations...")
+    valid_conversations = {}
+    invalid_count = 0
+    
+    for conv_id, messages in conversations.items():
+        # 최소 1개 이상의 메시지 필요
+        if len(messages) < 1:
+            invalid_count += 1
+            logger.warning(f"Conversation {conv_id} has no messages, skipping")
+            continue
+            
+        # 홀수 개의 메시지 체크 (마지막이 user 메시지여야 함)
+        if len(messages) % 2 == 0:
+            if args.debug_conversations:
+                logger.warning(f"Conversation {conv_id} has even number of messages ({len(messages)}), may cause issues")
+            
+        # 첫 번째 메시지가 user인지 확인
+        if messages[0].get("role") != "user":
+            if args.debug_conversations:
+                logger.warning(f"Conversation {conv_id} doesn't start with user message: {messages[0].get('role')}")
+        
+        # 상세 디버깅 정보
+        if args.debug_conversations and len(messages) <= 3:
+            roles = [msg.get('role', 'unknown') for msg in messages]
+            logger.info(f"Conversation {conv_id}: {len(messages)} messages with roles: {roles}")
+            
+        valid_conversations[conv_id] = messages
+    
+    if invalid_count > 0:
+        logger.warning(f"Removed {invalid_count} invalid conversations")
+        
+    conversations = valid_conversations
+    logger.info(f"Using {len(conversations)} valid conversations for benchmarking")
+
     # Create benchmark configurations
     client_args, req_args = get_client_config(args, conversations)
 
@@ -1510,14 +1957,14 @@ async def main() -> None:
 
         logger.info(f"{Color.PURPLE}Warmup start{Color.RESET}")
         conversations, _ = await main_mp(
-            warmup_client_args, req_args, warmup_bench_args, tokenizer, conversations
+            warmup_client_args, req_args, warmup_bench_args, tokenizer, conversations, False, args.host_log_dir, args.simulate_server_metrics
         )
         logger.info(f"{Color.PURPLE}Warmup done{Color.RESET}")
 
     # Run the benchmark
     start_time = time.perf_counter_ns()
     client_convs, client_metrics = await main_mp(
-        client_args, req_args, bench_args, tokenizer, conversations
+        client_args, req_args, bench_args, tokenizer, conversations, args.log_token_correlation, args.host_log_dir, args.simulate_server_metrics
     )
     total_runtime_ms = nanosec_to_millisec(time.perf_counter_ns() - start_time)
 
