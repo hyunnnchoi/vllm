@@ -181,7 +181,7 @@ class TokenLogger:
         self.log_file = self.log_dir / f"token_correlation_{timestamp}.csv"
         self.server_log_file = self.log_dir / f"server_logs_{timestamp}.txt"
         
-        # CSV 헤더에 실제 캐시 적중률 추가
+        # CSV 헤더에 모든 서버 메트릭 추가
         self.fieldnames = [
             'timestamp',
             'conversation_id', 
@@ -197,6 +197,9 @@ class TokenLogger:
             'prompt_throughput',
             'generation_throughput',
             'gpu_kv_cache_usage',
+            'running_requests',
+            'waiting_requests',
+            'engine_id',
             'ttft_ms',
             'tpot_ms',
             'latency_ms'
@@ -207,6 +210,9 @@ class TokenLogger:
         self.latest_prompt_throughput = None
         self.latest_generation_throughput = None
         self.latest_gpu_kv_cache_usage = None
+        self.latest_running_requests = None
+        self.latest_waiting_requests = None
+        self.latest_engine_id = None
         self.log_monitor_thread = None
         self.log_buffer = deque(maxlen=1000)  # 최근 1000개 로그 라인 저장
         
@@ -278,7 +284,7 @@ class TokenLogger:
             logger.warning(f"Docker log monitoring failed: {e}")
     
     def parse_server_log(self, line: str):
-        """서버 로그에서 캐시 적중률과 성능 메트릭 정보 추출"""
+        """서버 로그에서 모든 성능 메트릭 정보 추출"""
         # 로그 라인을 버퍼에 저장
         self.log_buffer.append(f"{datetime.now().isoformat()}: {line}")
         
@@ -289,6 +295,21 @@ class TokenLogger:
         except Exception:
             pass  # 파일 쓰기 실패해도 메인 기능에 영향 주지 않음
         
+        # 전체 Engine 로그 파싱 (예: Engine 000: Avg prompt throughput: 360.2 tokens/s, ...)
+        engine_pattern = r'Engine\s+(\d+):\s+Avg prompt throughput:\s*([\d.]+)\s*tokens/s,\s*Avg generation throughput:\s*([\d.]+)\s*tokens/s,\s*Running:\s*(\d+)\s*reqs,\s*Waiting:\s*(\d+)\s*reqs,\s*GPU KV cache usage:\s*([\d.]+)%,\s*Prefix cache hit rate:\s*([\d.]+)%'
+        
+        engine_match = re.search(engine_pattern, line)
+        if engine_match:
+            self.latest_engine_id = engine_match.group(1)
+            self.latest_prompt_throughput = float(engine_match.group(2))
+            self.latest_generation_throughput = float(engine_match.group(3))
+            self.latest_running_requests = int(engine_match.group(4))
+            self.latest_waiting_requests = int(engine_match.group(5))
+            self.latest_gpu_kv_cache_usage = float(engine_match.group(6))
+            self.latest_cache_hit_rate = float(engine_match.group(7))
+            return  # 전체 매치되면 개별 파싱은 스킵
+        
+        # 개별 메트릭 파싱 (폴백용)
         # Prefix cache hit rate 추출
         cache_match = re.search(r'Prefix cache hit rate:\s*([\d.]+)%', line)
         if cache_match:
@@ -307,13 +328,28 @@ class TokenLogger:
         gpu_cache_match = re.search(r'GPU KV cache usage:\s*([\d.]+)%', line)
         if gpu_cache_match:
             self.latest_gpu_kv_cache_usage = float(gpu_cache_match.group(1))
+            
+        # Running requests 추출
+        running_match = re.search(r'Running:\s*(\d+)\s*reqs', line)
+        if running_match:
+            self.latest_running_requests = int(running_match.group(1))
+            
+        # Waiting requests 추출
+        waiting_match = re.search(r'Waiting:\s*(\d+)\s*reqs', line)
+        if waiting_match:
+            self.latest_waiting_requests = int(waiting_match.group(1))
+            
+        # Engine ID 추출
+        engine_id_match = re.search(r'Engine\s+(\d+):', line)
+        if engine_id_match:
+            self.latest_engine_id = engine_id_match.group(1)
     
     def get_recent_logs(self, count: int = 50) -> list[str]:
         """최근 로그 라인들을 반환"""
         return list(self.log_buffer)[-count:]
     
     def log_request(self, request_stats: RequestStats, history_tokens: int, question_tokens: int) -> None:
-        """각 요청의 토큰 정보와 실제 캐시 적중률을 로그 파일에 기록"""
+        """각 요청의 토큰 정보와 모든 서버 메트릭을 로그 파일에 기록"""
         log_entry = {
             'timestamp': datetime.now().isoformat(),
             'conversation_id': request_stats.conversation_id,
@@ -329,6 +365,9 @@ class TokenLogger:
             'prompt_throughput': self.latest_prompt_throughput,
             'generation_throughput': self.latest_generation_throughput,
             'gpu_kv_cache_usage': self.latest_gpu_kv_cache_usage,
+            'running_requests': self.latest_running_requests,
+            'waiting_requests': self.latest_waiting_requests,
+            'engine_id': self.latest_engine_id,
             'ttft_ms': request_stats.ttft_ms,
             'tpot_ms': request_stats.tpot_ms,
             'latency_ms': request_stats.latency_ms
