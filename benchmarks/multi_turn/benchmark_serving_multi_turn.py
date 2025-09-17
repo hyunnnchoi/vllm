@@ -172,7 +172,7 @@ class MovingAverage:
 
 
 class TokenLogger:
-    def __init__(self, log_dir: str = "logs", host_log_dir: Optional[str] = None) -> None:
+    def __init__(self, log_dir: str = "logs", host_log_dir: Optional[str] = None, simulate_metrics: bool = False) -> None:
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(exist_ok=True)
         
@@ -234,6 +234,7 @@ class TokenLogger:
         self.latest_engine_id = None
         self.log_monitor_thread = None
         self.log_buffer = deque(maxlen=1000)  # 최근 1000개 로그 라인 저장
+        self.simulate_metrics = simulate_metrics
         
         # 컨테이너 내부 파일 생성
         with open(self.log_file, 'w', newline='', encoding='utf-8') as f:
@@ -264,30 +265,97 @@ class TokenLogger:
         logger.info(f"{Color.GREEN}Container server logs: {self.server_log_file}{Color.RESET}")
         
         # 서버 로그 모니터링 시작
-        self.start_log_monitoring()
+        if self.simulate_metrics:
+            logger.info(f"{Color.YELLOW}Using simulated server metrics for testing{Color.RESET}")
+            self.setup_simulated_metrics()
+        else:
+            self.start_log_monitoring()
     
     def start_log_monitoring(self):
         """서버 로그를 모니터링해서 캐시 적중률과 성능 메트릭 추출"""
         def monitor_logs():
-            try:
-                # journalctl을 사용해서 현재 프로세스의 로그 모니터링
-                # 일반적으로 vLLM 서버는 stdout으로 로그를 출력
-                cmd = ["journalctl", "-f", "--no-pager", "-t", "python3"]
-                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, 
-                                         stderr=subprocess.STDOUT, text=True, bufsize=1)
-                
-                for line in iter(process.stdout.readline, ''):
-                    line = line.strip()
-                    if line:
-                        self.parse_server_log(line)
-                        
-            except (subprocess.SubprocessError, FileNotFoundError):
-                # journalctl이 없거나 권한이 없는 경우 폴백
-                logger.warning("journalctl monitoring failed, trying alternative methods")
-                self.monitor_docker_logs()
+            # 여러 방법을 순차적으로 시도
+            methods = [
+                self.monitor_vllm_api_logs,
+                self.monitor_stdout_logs,
+                self.monitor_docker_logs,
+                self.monitor_journalctl_logs
+            ]
+            
+            for method in methods:
+                try:
+                    logger.info(f"Trying log monitoring method: {method.__name__}")
+                    method()
+                    break  # 성공하면 다른 방법 시도하지 않음
+                except Exception as e:
+                    logger.warning(f"Log monitoring method {method.__name__} failed: {e}")
+                    continue
+            else:
+                logger.warning("All log monitoring methods failed. Server metrics will not be available.")
         
         self.log_monitor_thread = threading.Thread(target=monitor_logs, daemon=True)
         self.log_monitor_thread.start()
+    
+    def monitor_vllm_api_logs(self):
+        """vLLM API 서버 로그를 직접 모니터링"""
+        try:
+            # vLLM 프로세스 찾기
+            result = subprocess.run(["pgrep", "-f", "vllm.entrypoints.openai.api_server"], 
+                                  capture_output=True, text=True)
+            if result.returncode == 0:
+                pid = result.stdout.strip().split('\n')[0]
+                logger.info(f"Found vLLM API server process: {pid}")
+                
+                # 프로세스 로그 모니터링 (여러 방법 시도)
+                for log_path in [f"/proc/{pid}/fd/1", f"/proc/{pid}/fd/2"]:
+                    try:
+                        cmd = ["tail", "-f", log_path]
+                        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, 
+                                                 stderr=subprocess.DEVNULL, text=True, bufsize=1)
+                        
+                        for line in iter(process.stdout.readline, ''):
+                            line = line.strip()
+                            if line and "Engine" in line:
+                                self.parse_server_log(line)
+                                
+                    except Exception:
+                        continue
+            else:
+                raise Exception("vLLM API server process not found")
+                
+        except Exception as e:
+            raise Exception(f"vLLM API log monitoring failed: {e}")
+    
+    def monitor_stdout_logs(self):
+        """표준 출력에서 로그 캡처 시도"""
+        try:
+            # 현재 터미널의 stdout 모니터링
+            cmd = ["script", "-f", "/dev/null"]
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, 
+                                     stderr=subprocess.PIPE, text=True, bufsize=1)
+            
+            for line in iter(process.stdout.readline, ''):
+                line = line.strip()
+                if line and ("Engine" in line or "tokens/s" in line):
+                    self.parse_server_log(line)
+                    
+        except Exception as e:
+            raise Exception(f"stdout monitoring failed: {e}")
+    
+    def monitor_journalctl_logs(self):
+        """journalctl을 사용한 로그 모니터링"""
+        try:
+            cmd = ["journalctl", "-f", "--no-pager", "-t", "python3"]
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, 
+                                     stderr=subprocess.STDOUT, text=True, bufsize=1)
+            
+            for line in iter(process.stdout.readline, ''):
+                line = line.strip()
+                if line:
+                    self.parse_server_log(line)
+                    
+        except Exception as e:
+            raise Exception(f"journalctl monitoring failed: {e}")
     
     def monitor_docker_logs(self):
         """Docker 컨테이너 로그 모니터링 (폴백 방법)"""
@@ -388,6 +456,21 @@ class TokenLogger:
         engine_id_match = re.search(r'Engine\s+(\d+):', line)
         if engine_id_match:
             self.latest_engine_id = engine_id_match.group(1)
+    
+    def setup_simulated_metrics(self):
+        """테스트용 시뮬레이션 메트릭 설정"""
+        import random
+        self.latest_cache_hit_rate = round(random.uniform(85.0, 95.0), 1)
+        self.latest_prompt_throughput = round(random.uniform(300.0, 600.0), 1)
+        self.latest_generation_throughput = round(random.uniform(100.0, 150.0), 1)
+        self.latest_gpu_kv_cache_usage = round(random.uniform(1.0, 5.0), 1)
+        self.latest_running_requests = random.randint(1, 8)
+        self.latest_waiting_requests = random.randint(0, 3)
+        self.latest_engine_id = "000"
+        
+        logger.info(f"Simulated metrics: cache_hit={self.latest_cache_hit_rate}%, "
+                   f"prompt_tput={self.latest_prompt_throughput}, "
+                   f"gen_tput={self.latest_generation_throughput}")
     
     def get_recent_logs(self, count: int = 50) -> list[str]:
         """최근 로그 라인들을 반환"""
@@ -1145,6 +1228,7 @@ async def main_mp(
     input_conv: ConversationsMap,
     enable_token_logging: bool = False,
     host_log_dir: Optional[str] = None,
+    simulate_metrics: bool = False,
 ) -> tuple[ConversationsMap, list[RequestStats]]:
     # An event that will trigger graceful termination of all the clients
     stop_event = mp.Event()
@@ -1170,7 +1254,7 @@ async def main_mp(
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             actual_host_log_dir = f"{host_log_dir}/vllm_benchmark_logs_{timestamp}"
             
-        token_logger = TokenLogger(host_log_dir=actual_host_log_dir)
+        token_logger = TokenLogger(host_log_dir=actual_host_log_dir, simulate_metrics=simulate_metrics)
 
     # Start all clients
     start_time = time.perf_counter_ns()
@@ -1731,6 +1815,13 @@ async def main() -> None:
         default=None,
         help="Host directory to save logs (outside container). Creates subdirectory if needed.",
     )
+    
+    parser.add_argument(
+        "--simulate-server-metrics",
+        default=False,
+        action="store_true",
+        help="Simulate server metrics for testing (when log monitoring fails)",
+    )
 
     args = parser.parse_args()
 
@@ -1880,14 +1971,14 @@ async def main() -> None:
 
         logger.info(f"{Color.PURPLE}Warmup start{Color.RESET}")
         conversations, _ = await main_mp(
-            warmup_client_args, req_args, warmup_bench_args, tokenizer, conversations, False, args.host_log_dir
+            warmup_client_args, req_args, warmup_bench_args, tokenizer, conversations, False, args.host_log_dir, args.simulate_server_metrics
         )
         logger.info(f"{Color.PURPLE}Warmup done{Color.RESET}")
 
     # Run the benchmark
     start_time = time.perf_counter_ns()
     client_convs, client_metrics = await main_mp(
-        client_args, req_args, bench_args, tokenizer, conversations, args.log_token_correlation, args.host_log_dir
+        client_args, req_args, bench_args, tokenizer, conversations, args.log_token_correlation, args.host_log_dir, args.simulate_server_metrics
     )
     total_runtime_ms = nanosec_to_millisec(time.perf_counter_ns() - start_time)
 
