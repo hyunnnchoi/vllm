@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
 import asyncio
+import csv
 import json
 import logging
 import multiprocessing as mp
@@ -12,6 +13,7 @@ from collections import Counter, deque
 from datetime import datetime
 from enum import Enum
 from http import HTTPStatus
+from pathlib import Path
 from statistics import mean
 from typing import NamedTuple, Optional, Union
 
@@ -164,6 +166,61 @@ class MovingAverage:
         if self.count == 0:
             return "no data"
         return f"avg: {self.avg:>10.3f} ({self.count} samples)"
+
+
+class TokenLogger:
+    def __init__(self, log_dir: str = "logs") -> None:
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(exist_ok=True)
+        
+        # 타임스탬프가 포함된 파일명 생성
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_file = self.log_dir / f"token_correlation_{timestamp}.csv"
+        
+        # CSV 헤더 작성
+        self.fieldnames = [
+            'timestamp',
+            'conversation_id', 
+            'client_id',
+            'turn_number',
+            'input_num_tokens',
+            'output_num_tokens',
+            'input_num_turns',
+            'history_tokens',
+            'question_tokens',
+            'approx_cached_percent',
+            'ttft_ms',
+            'tpot_ms',
+            'latency_ms'
+        ]
+        
+        with open(self.log_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            writer.writeheader()
+            
+        logger.info(f"{Color.GREEN}Token correlation log will be saved to: {self.log_file}{Color.RESET}")
+    
+    def log_request(self, request_stats: RequestStats, history_tokens: int, question_tokens: int) -> None:
+        """각 요청의 토큰 정보를 로그 파일에 기록"""
+        log_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'conversation_id': request_stats.conversation_id,
+            'client_id': request_stats.client_id,
+            'turn_number': request_stats.input_num_turns,
+            'input_num_tokens': request_stats.input_num_tokens,
+            'output_num_tokens': request_stats.output_num_tokens,
+            'input_num_turns': request_stats.input_num_turns,
+            'history_tokens': history_tokens,
+            'question_tokens': question_tokens,
+            'approx_cached_percent': request_stats.approx_cached_percent,
+            'ttft_ms': request_stats.ttft_ms,
+            'tpot_ms': request_stats.tpot_ms,
+            'latency_ms': request_stats.latency_ms
+        }
+        
+        with open(self.log_file, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            writer.writerow(log_entry)
 
 
 class DebugStats:
@@ -364,6 +421,7 @@ async def send_turn(
     req_args: RequestArgs,
     verbose: bool,
     verify_output: bool,
+    token_logger: Optional[TokenLogger] = None,
 ) -> Optional[RequestStats]:
     assert messages_to_use > 0
     assert messages_to_use <= len(conversation_messages)
@@ -480,6 +538,10 @@ async def send_turn(
         client_id=client_id,
     )
 
+    # 토큰 상관관계 로깅
+    if token_logger is not None:
+        token_logger.log_request(rs, history_num_tokens, question_num_tokens)
+
     if verbose:
         print(
             f"\n{Color.YELLOW}Response ({output_num_tokens} tokens):{Color.RESET}",
@@ -535,6 +597,7 @@ async def client_main(
     task_queue: mp.Queue,
     result_queue: mp.Queue,
     conv_queue: mp.Queue,
+    token_logger: Optional[TokenLogger] = None,
 ) -> None:
     logger.info(
         f"{Color.CYAN}Started client {client_id}: max_num_requests={args.max_num_requests}, max_active_conversations={args.max_active_conversations}{Color.RESET}"  # noqa: E501
@@ -666,6 +729,7 @@ async def client_main(
                     req_args,
                     args.print_content,
                     args.verify_output,
+                    token_logger,
                 )
                 if result is not None:
                     result_queue.put(result)
@@ -743,6 +807,7 @@ def worker_function(
     task_queue: mp.Queue,
     result_queue: mp.Queue,
     conv_queue: mp.Queue,
+    token_logger: Optional[TokenLogger] = None,
 ) -> None:
     asyncio.run(
         client_main(
@@ -754,6 +819,7 @@ def worker_function(
             task_queue,
             result_queue,
             conv_queue,
+            token_logger,
         )
     )
 
@@ -844,6 +910,7 @@ async def main_mp(
     bench_args: BenchmarkArgs,
     tokenizer: AutoTokenizer,
     input_conv: ConversationsMap,
+    enable_token_logging: bool = False,
 ) -> tuple[ConversationsMap, list[RequestStats]]:
     # An event that will trigger graceful termination of all the clients
     stop_event = mp.Event()
@@ -858,6 +925,11 @@ async def main_mp(
     conv_queue: mp.Queue = mp.Queue()
     output_conv: ConversationsMap = {}
     client_metrics: list[RequestStats] = []
+
+    # 토큰 로거 초기화 (필요한 경우)
+    token_logger = None
+    if enable_token_logging:
+        token_logger = TokenLogger()
 
     # Start all clients
     start_time = time.perf_counter_ns()
@@ -877,6 +949,7 @@ async def main_mp(
                 task_queue,
                 result_queue,
                 conv_queue,
+                token_logger,
             ),
         )
         clients.append(client)
@@ -1396,6 +1469,13 @@ async def main() -> None:
         " A comma separated list of percentages can be used "
         "(for example: --warmup-percentages=0%%,50%%)",
     )
+    
+    parser.add_argument(
+        "--log-token-correlation",
+        default=False,
+        action="store_true",
+        help="Enable logging of input/output token correlation to CSV file in logs/ directory",
+    )
 
     args = parser.parse_args()
 
@@ -1510,14 +1590,14 @@ async def main() -> None:
 
         logger.info(f"{Color.PURPLE}Warmup start{Color.RESET}")
         conversations, _ = await main_mp(
-            warmup_client_args, req_args, warmup_bench_args, tokenizer, conversations
+            warmup_client_args, req_args, warmup_bench_args, tokenizer, conversations, False
         )
         logger.info(f"{Color.PURPLE}Warmup done{Color.RESET}")
 
     # Run the benchmark
     start_time = time.perf_counter_ns()
     client_convs, client_metrics = await main_mp(
-        client_args, req_args, bench_args, tokenizer, conversations
+        client_args, req_args, bench_args, tokenizer, conversations, args.log_token_correlation
     )
     total_runtime_ms = nanosec_to_millisec(time.perf_counter_ns() - start_time)
 
