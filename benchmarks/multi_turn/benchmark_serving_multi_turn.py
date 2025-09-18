@@ -780,6 +780,8 @@ async def send_turn(
     output_num_tokens = get_token_count(tokenizer, output_content)
 
     # Prefix caching approximated cached percent
+    # 실제 KV cache hit rate가 아니라, 현재 Input Token 중에서 History Token이 차지하는 비율을 계산
+    # e.g., input_num_tokens = 1000, history_num_tokens = 800 -> approx_cached_percent = 80%
     approx_cached_percent = (
         100.0 * (history_num_tokens / input_num_tokens) if input_num_tokens > 0 else 0.0
     )
