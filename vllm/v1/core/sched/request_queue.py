@@ -8,14 +8,18 @@ from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable, Iterator
 from enum import Enum
+from typing import Optional
 
 from vllm.v1.request import Request
+
+from vllm.v1.core.sched.predictor import LTRPredictor
 
 
 class SchedulingPolicy(Enum):
     """Enum for scheduling policies."""
     FCFS = "fcfs"
     PRIORITY = "priority"
+    LTR="ltr"
 
 
 class RequestQueue(ABC):
@@ -214,11 +218,62 @@ class PriorityRequestQueue(RequestQueue):
         return reversed(list(self))
 
 
-def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
+class LTRRequestQueue(RequestQueue):
+    def __init__(self, model: str, predictor_model_path: str) -> None:
+        self.requests: list[Request] = []
+        self.predictor = LTRPredictor(model, predictor_model_path)
+
+    def add_request(self, request: Request) -> None:
+        request.promote = False
+        request.starvation = 0
+        request.quantum = None
+        request.score = self.predictor.get_score(request.prompt_token_ids)
+
+        self.requests.append(request)
+
+    def pop_request(self) -> Request:
+        raise NotImplementedError
+
+    def peek_request(self) -> Request:
+        raise NotImplementedError
+
+    def prepend_request(self, request: Request) -> None:
+        raise NotImplementedError
+
+    def prepend_requests(self, requests: RequestQueue) -> None:
+        raise NotImplementedError
+
+    def remove_request(self, request: Request) -> None:
+        raise NotImplementedError
+
+    def remove_requests(self, requests: Iterable[Request]) -> None:
+        print("Error")
+        raise NotImplementedError
+
+    def __bool__(self) -> bool:
+        return bool(self.requests)
+
+    def __len__(self) -> int:
+        return self.requests.__len__()
+
+    def __iter__(self) -> Iterator[Request]:
+        return self.requests.__iter__()
+
+    def __reversed__(self) -> Iterator[Request]:
+        return self.requests.__reversed__()
+
+
+def create_request_queue(
+    policy: SchedulingPolicy, 
+    model: Optional[str] = None, 
+    predictor_model_path: Optional[str] = None
+) -> RequestQueue:
     """Create request queue based on scheduling policy."""
     if policy == SchedulingPolicy.PRIORITY:
         return PriorityRequestQueue()
     elif policy == SchedulingPolicy.FCFS:
         return FCFSRequestQueue()
+    elif policy == SchedulingPolicy.LTR:
+        return LTRRequestQueue(model, predictor_model_path)
     else:
         raise ValueError(f"Unknown scheduling policy: {policy}")
