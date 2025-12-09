@@ -26,9 +26,18 @@ class SchedulerLTR(Scheduler):
     """
     Scheduler that uses Least Time Remaining (LTR) policy.
     
+    LTR scheduling prioritizes requests based on their estimated remaining
+    execution time. Requests with less remaining time are scheduled first,
+    which can help minimize average response time and improve throughput.
+    
     This scheduler initializes the base Scheduler with FCFS policy to avoid
     issues during base initialization, then switches to LTR policy and
     recreates the waiting queue appropriately.
+    
+    Use this scheduler when:
+    - You want to minimize average response time
+    - Request completion time estimates are available
+    - Shorter requests should be prioritized over longer ones
     """
 
     def __init__(

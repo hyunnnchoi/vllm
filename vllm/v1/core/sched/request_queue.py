@@ -433,7 +433,11 @@ class LTRRequestQueue(RequestQueue):
         return len(self._request_set)
 
     def __iter__(self) -> Iterator[Request]:
-        """Iterate over the queue according to LTR policy."""
+        """Iterate over the queue according to LTR policy.
+        
+        Note: Duplicates are prevented because add_request() checks
+        self._request_set before adding. Only requests currently in
+        the queue are yielded."""
         # Create sorted list by (remaining_time, arrival_time)
         # Only include requests that are still in the queue (not removed)
         valid_requests = [
