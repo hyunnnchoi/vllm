@@ -61,13 +61,11 @@ class SchedulerLTR(Scheduler):
         # The nested objects (model_config, cache_config, etc.) don't need
         # to be copied since we're not modifying them.
         patched_config = copy.copy(vllm_config)
-        patched_sched_cfg = copy.copy(
-            getattr(vllm_config, "scheduler_config", vllm_config.scheduler_config)
-        )
-        # Ensure there is a policy attribute; set to "fcfs" for base initialization
+        patched_sched_cfg = copy.copy(vllm_config.scheduler_config)
+        # Set to "fcfs" for base initialization.
         # The base Scheduler expects a known policy string, so we use "fcfs"
         # which is the simplest and most predictable for initialization.
-        setattr(patched_sched_cfg, "policy", "fcfs")
+        patched_sched_cfg.policy = "fcfs"
         patched_config.scheduler_config = patched_sched_cfg
 
         # Initialize the base Scheduler with the patched config

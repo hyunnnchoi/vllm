@@ -365,7 +365,7 @@ class LTRRequestQueue(RequestQueue):
         if request.request_id in self._request_set:
             return  # Already in queue
         # Use predicted_remaining_tokens as a proxy for remaining time
-        remaining_time = getattr(request, 'predicted_remaining_tokens', float('inf'))
+        remaining_time = request.predicted_remaining_tokens
         heapq.heappush(
             self._heap,
             (remaining_time, request.arrival_time, request)
@@ -396,14 +396,21 @@ class LTRRequestQueue(RequestQueue):
         return request
 
     def prepend_request(self, request: Request) -> None:
-        """Add a request to the queue according to LTR policy.
+        """Add a request back to the queue according to LTR policy.
         
-        Note: In LTR, there is no concept of prepending. Requests are 
-        ordered by (remaining_time, arrival_time)."""
+        Note: In LTR (priority-based queue), requests cannot truly be 
+        "prepended" to the front. Instead, they are added according to 
+        their remaining time priority. This ensures LTR ordering is maintained.
+        This method exists to satisfy the RequestQueue interface."""
         self.add_request(request)
 
     def prepend_requests(self, requests: RequestQueue) -> None:
-        """Add all requests from another queue according to LTR policy."""
+        """Add requests back to the queue according to LTR policy.
+        
+        Note: In LTR (priority-based queue), requests cannot truly be 
+        "prepended" to the front. Instead, they are added according to 
+        their remaining time priority. This ensures LTR ordering is maintained.
+        This method exists to satisfy the RequestQueue interface."""
         for request in requests:
             self.add_request(request)
 
@@ -428,16 +435,14 @@ class LTRRequestQueue(RequestQueue):
     def __iter__(self) -> Iterator[Request]:
         """Iterate over the queue according to LTR policy."""
         # Create sorted list by (remaining_time, arrival_time)
+        # Only include requests that are still in the queue (not removed)
         valid_requests = [
             (p, t, r) for p, t, r in self._heap 
             if r.request_id in self._request_set
         ]
         valid_requests.sort(key=lambda x: (x[0], x[1]))
-        seen = set()
         for _, _, request in valid_requests:
-            if request.request_id not in seen:
-                seen.add(request.request_id)
-                yield request
+            yield request
 
     def __reversed__(self) -> Iterator[Request]:
         """Iterate over the queue in reverse LTR order."""
