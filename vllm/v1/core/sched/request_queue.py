@@ -19,8 +19,6 @@ class SchedulingPolicy(Enum):
     # [NOTE, hyunnnchoi, 2025.12.01] ELIS ISRTF scheduling policy
     # Based on: https://arxiv.org/abs/2505.09142
     ISRTF = "isrtf"
-    # LTR (Least Time Remaining) scheduling policy
-    LTR = "ltr"
 
 
 class RequestQueue(ABC):
@@ -346,113 +344,6 @@ class ISRTFRequestQueue(RequestQueue):
         return reversed(list(self))
 
 
-class LTRRequestQueue(RequestQueue):
-    """
-    Least Time Remaining (LTR) queue for scheduling.
-    
-    Requests with smaller estimated remaining time are processed first.
-    This is similar to ISRTF but focuses on time-based scheduling.
-    """
-
-    def __init__(self) -> None:
-        # Heap entries: (estimated_remaining_time, arrival_time, request)
-        self._heap: list[tuple[float, float, Request]] = []
-        # Track requests for efficient removal
-        self._request_set: set[str] = set()
-
-    def add_request(self, request: Request) -> None:
-        """Add a request to the queue according to LTR policy."""
-        if request.request_id in self._request_set:
-            return  # Already in queue
-        # Use predicted_remaining_tokens as a proxy for remaining time
-        remaining_time = request.predicted_remaining_tokens
-        heapq.heappush(
-            self._heap,
-            (remaining_time, request.arrival_time, request)
-        )
-        self._request_set.add(request.request_id)
-
-    def pop_request(self) -> Request:
-        """Pop a request with least remaining time."""
-        if not self._heap:
-            raise IndexError("pop from empty heap")
-        while self._heap:
-            _, _, request = heapq.heappop(self._heap)
-            if request.request_id in self._request_set:
-                self._request_set.remove(request.request_id)
-                return request
-        raise IndexError("pop from empty heap")
-
-    def peek_request(self) -> Request:
-        """Peek at the request with least remaining time."""
-        if not self._heap:
-            raise IndexError("peek from empty heap")
-        # Skip removed requests
-        while self._heap and self._heap[0][2].request_id not in self._request_set:
-            heapq.heappop(self._heap)
-        if not self._heap:
-            raise IndexError("peek from empty heap")
-        _, _, request = self._heap[0]
-        return request
-
-    def prepend_request(self, request: Request) -> None:
-        """Add a request back to the queue according to LTR policy.
-        
-        Note: In LTR (priority-based queue), requests cannot truly be 
-        "prepended" to the front. Instead, they are added according to 
-        their remaining time priority. This ensures LTR ordering is maintained.
-        This method exists to satisfy the RequestQueue interface."""
-        self.add_request(request)
-
-    def prepend_requests(self, requests: RequestQueue) -> None:
-        """Add requests back to the queue according to LTR policy.
-        
-        Note: In LTR (priority-based queue), requests cannot truly be 
-        "prepended" to the front. Instead, they are added according to 
-        their remaining time priority. This ensures LTR ordering is maintained.
-        This method exists to satisfy the RequestQueue interface."""
-        for request in requests:
-            self.add_request(request)
-
-    def remove_request(self, request: Request) -> None:
-        """Remove a specific request from the queue."""
-        self._request_set.discard(request.request_id)
-        # Lazy removal - actual heap entry will be skipped in pop/peek
-
-    def remove_requests(self, requests: Iterable[Request]) -> None:
-        """Remove multiple specific requests from the queue."""
-        for request in requests:
-            self._request_set.discard(request.request_id)
-
-    def __bool__(self) -> bool:
-        """Check if queue has any requests."""
-        return bool(self._request_set)
-
-    def __len__(self) -> int:
-        """Get number of requests in queue."""
-        return len(self._request_set)
-
-    def __iter__(self) -> Iterator[Request]:
-        """Iterate over the queue according to LTR policy.
-        
-        Note: Duplicates are prevented because add_request() checks
-        self._request_set before adding. Only requests currently in
-        the queue are yielded."""
-        # Create sorted list by (remaining_time, arrival_time)
-        # Only include requests that are still in the queue (not removed)
-        valid_requests = [
-            (p, t, r) for p, t, r in self._heap 
-            if r.request_id in self._request_set
-        ]
-        valid_requests.sort(key=lambda x: (x[0], x[1]))
-        for _, _, request in valid_requests:
-            yield request
-
-    def __reversed__(self) -> Iterator[Request]:
-        """Iterate over the queue in reverse LTR order."""
-        return reversed(list(self))
-
-
 def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
     """Create request queue based on scheduling policy."""
     if policy == SchedulingPolicy.PRIORITY:
@@ -462,7 +353,5 @@ def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
     # [NOTE, hyunnnchoi, 2025.12.01] ELIS ISRTF scheduling
     elif policy == SchedulingPolicy.ISRTF:
         return ISRTFRequestQueue()
-    elif policy == SchedulingPolicy.LTR:
-        return LTRRequestQueue()
     else:
         raise ValueError(f"Unknown scheduling policy: {policy}")
