@@ -91,11 +91,11 @@ class LTRPredictor:
                     local_files_only=True
                 )
             except Exception:
-                logger.warning(
+                logger.error(
                     f"[LTR] Could not load tokenizer from {predictor_model_path}. "
-                    "Falling back to facebook/opt-125m"
+                    "Please ensure the predictor model directory contains a valid tokenizer configuration (e.g., tokenizer_config.json)."
                 )
-                return AutoTokenizer.from_pretrained("facebook/opt-125m")
+                raise RuntimeError(f"Failed to load tokenizer for predictor model at {predictor_model_path}.")
     
     def get_score(self, prompt_token_ids: list[int]) -> float:
         """
