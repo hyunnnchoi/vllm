@@ -352,9 +352,9 @@ class ISRTFRequestQueue(RequestQueue):
 
 # [NOTE, hjhoon03, 2025.12.17] LTR Request Queue
 class LTRRequestQueue(RequestQueue):
-    def __init__(self, model: str, predictor_model_path: str) -> None:
+    def __init__(self, target_model: str, predictor_model_name: str, predictor_model_path: str) -> None:
         self.requests: list[Request] = []
-        self.predictor = LTRPredictor(model, predictor_model_path)
+        self.predictor = LTRPredictor(target_model, predictor_model_name, predictor_model_path)
 
     def add_request(self, request: Request) -> None:
         request.promote = False
@@ -398,7 +398,8 @@ class LTRRequestQueue(RequestQueue):
 
 def create_request_queue(
     policy: SchedulingPolicy,
-    model: Optional[str] = None, 
+    target_model: Optional[str] = None, 
+    predictor_model_name: Optional[str] = None,
     predictor_model_path: Optional[str] = None
 ) -> RequestQueue:
     """Create request queue based on scheduling policy."""
@@ -411,6 +412,6 @@ def create_request_queue(
         return ISRTFRequestQueue()
     # [NOTE, hjhoon03, 2025.12.17] LTR scheduling
     elif policy == SchedulingPolicy.LTR:
-        return LTRRequestQueue(model, predictor_model_path)
+        return LTRRequestQueue(target_model, predictor_model_name, predictor_model_path)
     else:
         raise ValueError(f"Unknown scheduling policy: {policy}")

@@ -125,17 +125,16 @@ class LTRScheduler(SchedulerInterface):
             raise ValueError(
                 f"Unknown scheduling policy: {self.scheduler_config.policy}")
         
-        # Initialize LTR predictor
-        predictor_path = os.environ.get("VLLM_LTR_PREDICTOR_PATH")
-        if predictor_path is None:
-            raise ValueError(
-                "VLLM_LTR_PREDICTOR_PATH must be set for LTR scheduling"
-            )
-        
-        logger.info("[LTR] Initializing predictor from %s", predictor_path)
+        # [NOTE, hjhoon03, 2025-12-19] Initialize LTR request queue and predictor model
+        logger.info("[LTR] Initializing predictor from %s", self.scheduler_config.predictor_model_path)
 
         # Priority queues for requests.
-        self.waiting = create_request_queue(self.policy, self.vllm_config.model_config.model, predictor_path)
+        self.waiting = create_request_queue(
+            self.policy, 
+            target_model=self.vllm_config.model_config.model, 
+            predictor_model_name=self.scheduler_config.predictor_model_name, 
+            predictor_model_path=self.scheduler_config.predictor_model_path
+        )
         self.running: list[Request] = []
 
         # The request IDs that are finished in between the previous and the

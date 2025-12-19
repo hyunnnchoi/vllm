@@ -20,7 +20,8 @@ logger = init_logger(__name__)
 RunnerType = Literal["generate", "pooling", "draft"]
 # [NOTE, hyunnnchoi, 2025.12.01] Added "isrtf" for ELIS scheduling
 # Based on: https://arxiv.org/abs/2505.09142
-SchedulerPolicy = Literal["fcfs", "priority", "isrtf"]
+# [NOTE, hyunnnchoi, 2025.12.19] Added "ltr" for learning-to-rank scheduling
+SchedulerPolicy = Literal["fcfs", "priority", "isrtf", "ltr"]
 
 
 @config
@@ -145,6 +146,19 @@ class SchedulerConfig:
     reduce the CPU overheads, leading to better latency and throughput. However,
     async scheduling is currently not supported with some features such as
     structured outputs, speculative decoding, and pipeline parallelism.
+    """
+
+    # [NOTE, hjhoon03, 2025-12-19] For ltr policy
+    predictor_model_name: str = ""
+    """Score predictor model path, required only if scheduling policy is "ltr".
+    Predictor must be based on opt-125m or opt-350m.
+    Model name must include the base model name.
+    """
+
+    predictor_model_path: str = ""
+    """Score predictor model path, required only if scheduling policy is "ltr".
+    Predictor must be based on opt-125m or opt-350m.
+    config.json and model.safetensors must be contained in the path dir.
     """
 
     def compute_hash(self) -> str:
