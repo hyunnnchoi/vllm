@@ -444,6 +444,9 @@ class EngineArgs:
         ObservabilityConfig.collect_detailed_traces
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
     scheduler_cls: Union[str, Type[object]] = SchedulerConfig.scheduler_cls
+    # [NOTE, hjhoon03, 2025-12-19] For LTRScheduler
+    predictor_model_name: str = SchedulerConfig.predictor_model_name
+    predictor_model_path: str = SchedulerConfig.predictor_model_path
 
     pooler_config: Optional[PoolerConfig] = ModelConfig.pooler_config
     override_pooler_config: Optional[Union[dict, PoolerConfig]] = \
@@ -909,6 +912,13 @@ class EngineArgs:
             **scheduler_kwargs["disable_chunked_mm_input"])
         scheduler_group.add_argument("--scheduler-cls",
                                      **scheduler_kwargs["scheduler_cls"])
+        
+        # [NOTE, hjhoon03, 2025-12-19] For ltr predictor
+        scheduler_group.add_argument("--predictor-model-name",
+                                     **scheduler_kwargs["predictor_model_name"])
+        scheduler_group.add_argument("--predictor-model-path",
+                                    **scheduler_kwargs["predictor_model_path"])
+        
         scheduler_group.add_argument(
             "--disable-hybrid-kv-cache-manager",
             **scheduler_kwargs["disable_hybrid_kv_cache_manager"])
@@ -1371,6 +1381,8 @@ class EngineArgs:
                              and parallel_config.use_ray),
             policy=self.scheduling_policy,
             scheduler_cls=self.scheduler_cls,
+            predictor_model_name=self.predictor_model_name,
+            predictor_model_path=self.predictor_model_path,
             max_num_partial_prefills=self.max_num_partial_prefills,
             max_long_partial_prefills=self.max_long_partial_prefills,
             long_prefill_token_threshold=self.long_prefill_token_threshold,
@@ -1576,6 +1588,22 @@ class EngineArgs:
             if self.enable_prefix_caching is None:
                 self.enable_prefix_caching = incremental_prefill_supported
                 logger.info("(%s) prefix caching by default", action)
+
+        # [NOTE, hjhoon03, 2025.12.19]: Set args for LTR scheduler
+        if self.scheduling_policy == "ltr":
+            self.scheduler_cls = "vllm.v1.core.sched.ltr_scheduler.LTRScheduler"
+            if self.predictor_model_name == "" or self.predictor_model_path == "":
+                raise ValueError("""To use ltr policy, both --predictor-model-name and --predictor-model-path must be provided
+                                 The predictor model can be downloaded from https://huggingface.co/LLM-ltr/OPT-Predictors""")
+            if "opt-125m" not in self.predictor_model_name and "opt-350m" not in self.predictor_model_name:
+                raise ValueError("Model name must include the base model name (opt-125m or opt-350m).")
+            import os
+            if not os.path.isdir(self.predictor_model_path):
+                raise ValueError("""--predictor-model-path does not exist or is not directory""")
+            if not os.path.isfile(os.path.join(self.predictor_model_path, "config.json")):
+                raise ValueError("""--predictor-model-path must contain config.json.""")
+            if not os.path.isfile(os.path.join(self.predictor_model_path, "model.safetensors")):
+                raise ValueError("""--predictor-model-path must contain model.safetensors.""")
 
         # V1 should use the new scheduler by default.
         # Swap it only if this arg is set to the original V0 default
