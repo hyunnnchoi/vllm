@@ -20,7 +20,8 @@ logger = init_logger(__name__)
 RunnerType = Literal["generate", "pooling", "draft"]
 # [NOTE, hyunnnchoi, 2025.12.01] Added "isrtf" for ELIS scheduling
 # Based on: https://arxiv.org/abs/2505.09142
-SchedulerPolicy = Literal["fcfs", "priority", "isrtf"]
+# [NOTE, hyunnnchoi, 2025.12.09] Added "ltr" for Learning-to-Rank scheduling
+SchedulerPolicy = Literal["fcfs", "priority", "isrtf", "ltr"]
 
 
 @config
@@ -114,7 +115,9 @@ class SchedulerConfig:
     value means earlier handling) and time of arrival deciding any ties).\n
     - "isrtf" means Iterative Shortest Remaining Time First, using ELIS
     (https://arxiv.org/abs/2505.09142) to predict remaining tokens and
-    prioritize requests with fewer predicted remaining tokens."""
+    prioritize requests with fewer predicted remaining tokens.\n
+    - "ltr" means Learning-to-Rank, using a predictor model to score and
+    prioritize requests based on predicted latency."""
 
     chunked_prefill_enabled: bool = field(init=False)
     """True if chunked prefill is enabled."""
@@ -234,6 +237,11 @@ class SchedulerConfig:
         if self.async_scheduling:
             self.scheduler_cls = (
                 "vllm.v1.core.sched.async_scheduler.AsyncScheduler")
+        
+        # [NOTE, hyunnnchoi, 2025.12.09] Use LTRScheduler for LTR policy
+        if self.policy == "ltr":
+            self.scheduler_cls = "vllm.v1.core.sched.scheduler_ltr.LTRScheduler"
+            logger.info("Using LTRScheduler for LTR scheduling policy")
 
     @model_validator(mode='after')
     def _verify_args(self) -> Self:
