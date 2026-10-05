@@ -504,6 +504,11 @@ class GPUModelRunner(
         vllm_config: VllmConfig,
         device: torch.device,
     ):
+        # aris/layout-ctrlpath: route small pinned host<->GPU control copies
+        # through an SM kernel when enabled (no-op otherwise)
+        from vllm.v1.worker import ctrl_uva
+
+        ctrl_uva.install()
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
