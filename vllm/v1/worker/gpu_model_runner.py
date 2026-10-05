@@ -4460,6 +4460,10 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            if has_kv_transfer_group():
+                _pump_loads = getattr(get_kv_transfer_group(), "pump_loads", None)
+                if _pump_loads is not None:
+                    _pump_loads()
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,

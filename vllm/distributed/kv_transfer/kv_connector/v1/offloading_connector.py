@@ -118,6 +118,14 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         assert isinstance(self._connector_metadata, OffloadingConnectorMetadata)
         self.connector_worker.start_kv_transfers(self._connector_metadata)
 
+    def pump_loads(self) -> None:
+        """aris/layout-pacing: let a paced CPU->GPU load submit its next chunk
+        right before the forward (the step's input copies are already queued)."""
+        worker = getattr(self.connector_worker, "worker", None)
+        pump = getattr(worker, "pump_at_inputs", None)
+        if pump is not None:
+            pump()
+
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
 

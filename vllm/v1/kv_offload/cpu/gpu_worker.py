@@ -28,6 +28,7 @@ from vllm.v1.kv_offload.base import (
     TransferResult,
 )
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+from vllm.v1.kv_offload.cpu import swap_blocks_triton as _sbt
 from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
     THRESHOLD_BYTES,
     swap_blocks_batch,
@@ -308,6 +309,18 @@ class SingleDirectionOffloadingHandler:
         self.layer_refs_per_group = layer_refs_per_group
         self._swap_blocks_batch = _select_swap_blocks_fn(
             layer_refs_per_group, gpu_to_cpu
+        )
+        # aris/layout-pacing: Triton UVA copy usable for any page size when the
+        # control setting asks for it ("triton<k>", k = number of programs/SMs)
+        _pages = [r.page_size_bytes for g in layer_refs_per_group for r in g]
+        self._triton_fn = (
+            functools.partial(
+                swap_blocks_batch,
+                bytes_per_chunk=min(triton.next_power_of_2(max(_pages)), 8192),
+            )
+            if HAS_TRITON and not gpu_to_cpu and _pages and all(x % 8 == 0 for x in _pages)
+            and not current_platform.is_rocm() and not current_platform.is_xpu()
+            else None
         )
 
         # GPU blocks may be smaller
@@ -681,11 +694,16 @@ class SingleDirectionOffloadingHandler:
         # writing; we must keep STREAM ordering so source reads are gated
         # by the transfer stream's wait_stream(compute) barrier.
         is_src_access_order_any = not self.gpu_to_cpu
-        paced = not self.gpu_to_cpu and self._pacing_setting() != 0 and op_idx > 0
+        mode, val = self._mode() if not self.gpu_to_cpu else ("stock", 0)
+        paced = mode in ("pace", "pace_in", "adapt") and op_idx > 0
+        fn = self._swap_blocks_batch
+        if mode == "triton" and self._triton_fn is not None:
+            _sbt.NUM_SMS = val
+            fn = self._triton_fn
         with current_platform.stream(stream):
             start_event.record(stream)
             if op_idx > 0 and not paced:
-                self._swap_blocks_batch(
+                fn(
                     src,
                     dst,
                     sizes,
@@ -718,11 +736,13 @@ class SingleDirectionOffloadingHandler:
         return True
 
     def _pacing_budget(self) -> int:
-        raw = self._pacing_setting()
-        if raw >= 0:
-            return raw
-        nbytes = (-raw / 100.0) * self._pace_bw * self._pace_step_s
-        return int(min(max(nbytes, 16 << 20), 1 << 30))
+        mode, val = self._mode()
+        if mode in ("pace", "pace_in"):
+            return val
+        if mode == "adapt":
+            nbytes = (-val / 100.0) * self._pace_bw * self._pace_step_s
+            return int(min(max(nbytes, 16 << 20), 1 << 30))
+        return 0
 
     def _observe_step(self) -> None:
         now = time.perf_counter()
@@ -732,17 +752,43 @@ class SingleDirectionOffloadingHandler:
             self._pace_step_s = 0.5 * self._pace_step_s + 0.5 * dt
         self._pace_last_call = now
 
-    def _pacing_setting(self) -> int:
+    def _mode(self) -> tuple[str, int]:
+        """Control setting: '0' stock, '<n>' pace n bytes per chunk from
+        get_finished(), 'in:<n>' also pump right before the forward (after the
+        step's input copies), '-<p>' adaptive, 'triton<k>' Triton UVA copy with
+        k programs for every page size (no pacing)."""
         if self._pace_file is not None:
             try:
                 mtime = os.stat(self._pace_file).st_mtime
                 if mtime != self._pace_file_mtime:
                     with open(self._pace_file) as f:
-                        self._pace_bytes = int(f.read().strip() or 0)
+                        self._pace_raw = f.read().strip() or "0"
                     self._pace_file_mtime = mtime
-            except (OSError, ValueError):
+            except OSError:
                 pass
-        return self._pace_bytes
+        raw = getattr(self, "_pace_raw", str(self._pace_bytes))
+        try:
+            if raw.startswith("triton"):
+                return "triton", int(raw[6:])
+            if raw.startswith("in:"):
+                return "pace_in", int(raw[3:])
+            n = int(raw)
+        except ValueError:
+            return "stock", 0
+        if n > 0:
+            return "pace", n
+        if n < 0:
+            return "adapt", n
+        return "stock", 0
+
+    def _pacing_setting(self) -> int:
+        mode, _ = self._mode()
+        return 0 if mode in ("stock", "triton") else 1
+
+    def pump_at_inputs(self) -> None:
+        """Called right before the forward, after the step's input copies."""
+        if not self.gpu_to_cpu and self._mode()[0] == "pace_in":
+            self._pump()
 
     def _pump(self, force: bool = False) -> None:
         """Submit the next chunk of the oldest partially submitted load.
@@ -961,6 +1007,9 @@ class CPUOffloadingWorker(OffloadingWorker):
 
     def get_finished(self) -> list[TransferResult]:
         return self._store_handler.get_finished() + self._load_handler.get_finished()
+
+    def pump_at_inputs(self) -> None:
+        self._load_handler.pump_at_inputs()
 
     def wait(self, job_ids: set[int]) -> None:
         self._store_handler.wait(job_ids)
