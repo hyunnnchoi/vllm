@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
 import os
+import threading
 import time
 from collections import deque
 from collections.abc import Sequence
@@ -81,6 +82,9 @@ class Transfer:
     submitted: bool = True
     is_src_access_order_any: bool = False
     t_submit: float = 0.0
+    # wall-clock times when the monitor thread first saw start/end complete
+    t_start_seen: float = 0.0
+    t_end_seen: float = 0.0
 
 
 def compute_sub_block_ptrs(
@@ -380,6 +384,18 @@ class SingleDirectionOffloadingHandler:
         self._xfer_log = open(xfer_log, "a", buffering=1) if xfer_log else None
         self._xfer_dir = "store" if gpu_to_cpu else "load"
         self._xfer_last_call: float | None = None
+        # queue-mode flags ("ctrlq:<cap>:<chunk>:<flags>"): 't' = a pump thread
+        # refills the queue every 0.5 ms instead of once per engine step;
+        # 's' = shortest remaining load first (preemptive at chunk
+        # boundaries), loads no longer wait for the previous load, and
+        # finished loads are reported out of order.
+        self._q_thread = False
+        self._q_srpt = False
+        self._lock = threading.RLock()
+        self._bg: threading.Thread | None = None
+        self._bg_device = torch.cuda.current_device() if torch.cuda.is_available() else None
+        if self._xfer_log is not None:
+            self._start_bg()
 
         # job_id -> event
         self._transfer_events: dict[int, torch.Event] = {}
@@ -697,7 +713,9 @@ class SingleDirectionOffloadingHandler:
         # earlier step for a since-reallocated block; with async scheduling
         # nothing else orders that zeroing against this copy.
         stream.wait_stream(current_platform.current_stream())
-        if self._transfers:
+        mode, val = self._mode() if not self.gpu_to_cpu else ("stock", 0)
+        srpt = mode == "queue" and self._q_srpt
+        if self._transfers and not srpt:
             last_transfer: Transfer = self._transfers[-1]
             last_event = last_transfer.end_event
             # assure job will start only after the previous one completes
@@ -709,12 +727,12 @@ class SingleDirectionOffloadingHandler:
         # writing; we must keep STREAM ordering so source reads are gated
         # by the transfer stream's wait_stream(compute) barrier.
         is_src_access_order_any = not self.gpu_to_cpu
-        mode, val = self._mode() if not self.gpu_to_cpu else ("stock", 0)
         paced = mode in ("pace", "pace_in", "adapt", "queue") and op_idx > 0
         fn = self._swap_blocks_batch
         if mode == "triton" and self._triton_fn is not None:
             _sbt.NUM_SMS = val
             fn = self._triton_fn
+        t_call = time.time()   # before the copy call (a large batch call blocks)
         with current_platform.stream(stream):
             start_event.record(stream)
             if op_idx > 0 and not paced:
@@ -728,6 +746,7 @@ class SingleDirectionOffloadingHandler:
                 end_event.record(stream)
 
         self._transfer_events[job_id] = end_event
+        self._lock.acquire()
         self._transfers.append(
             Transfer(
                 job_id=job_id,
@@ -742,14 +761,46 @@ class SingleDirectionOffloadingHandler:
                 next_op=0,
                 submitted=not paced,
                 is_src_access_order_any=is_src_access_order_any,
-                t_submit=time.time(),
+                t_submit=t_call,
             )
         )
-        if paced:
-            self._pump()
+        try:
+            if paced:
+                self._pump()
+        finally:
+            self._lock.release()
 
         # success
         return True
+
+    def _start_bg(self) -> None:
+        if self._bg is not None:
+            return
+        self._bg = threading.Thread(target=self._bg_loop, daemon=True, name="kv-xfer-bg")
+        self._bg.start()
+
+    def _bg_loop(self) -> None:
+        if self._bg_device is not None:
+            torch.cuda.set_device(self._bg_device)
+        while True:
+            try:
+                if not self.gpu_to_cpu:
+                    mode = self._mode()[0]
+                    if mode == "queue" and self._q_thread:
+                        with self._lock:
+                            self._pump_queue()
+                if self._xfer_log is not None:
+                    with self._lock:
+                        snap = list(self._transfers)
+                    now = time.time()
+                    for t in snap:
+                        if t.t_start_seen == 0.0 and t.start_event.query():
+                            t.t_start_seen = now
+                        if t.submitted and t.t_end_seen == 0.0 and t.end_event.query():
+                            t.t_end_seen = now
+            except Exception as e:  # never kill the engine from here
+                logger.warning_once("kv-xfer-bg: %s", e)
+            time.sleep(0.0005)
 
     def _pacing_budget(self) -> int:
         mode, val = self._mode()
@@ -785,8 +836,14 @@ class SingleDirectionOffloadingHandler:
         raw = getattr(self, "_pace_raw", str(self._pace_bytes))
         try:
             if raw.startswith("ctrlq:"):
-                cap, chunk = (int(v) for v in raw[6:].split(":"))
+                parts = raw[6:].split(":")
+                cap, chunk = int(parts[0]), int(parts[1])
+                flags = parts[2] if len(parts) > 2 else ""
                 self._q_cap, self._q_chunk = cap, chunk
+                self._q_thread = "t" in flags
+                self._q_srpt = "s" in flags
+                if self._q_thread and not self.gpu_to_cpu:
+                    self._start_bg()
                 return "queue", cap
             if raw.startswith("triton"):
                 return "triton", int(raw[6:])
@@ -867,7 +924,11 @@ class SingleDirectionOffloadingHandler:
             self._q_chunks.popleft()
         in_flight = sum(n for _, n in self._q_chunks)
         while True:
-            pending = next((t for t in self._transfers if not t.submitted), None)
+            if self._q_srpt:
+                cands = [t for t in self._transfers if not t.submitted]
+                pending = min(cands, key=lambda t: t.num_ops - t.next_op) if cands else None
+            else:
+                pending = next((t for t in self._transfers if not t.submitted), None)
             if pending is None:
                 return
             start = pending.next_op
@@ -876,7 +937,7 @@ class SingleDirectionOffloadingHandler:
                 return
             end = start + n
             with current_platform.stream(pending.stream):
-                if start == 0:
+                if start == 0 and not self._q_srpt:
                     prev = None
                     for t in self._transfers:
                         if t is pending:
@@ -902,6 +963,10 @@ class SingleDirectionOffloadingHandler:
             in_flight += n
 
     def get_finished(self) -> list[TransferResult]:
+        with self._lock:
+            return self._get_finished_locked()
+
+    def _get_finished_locked(self) -> list[TransferResult]:
         if not self.gpu_to_cpu:
             self._observe_step()
             self._pump()
@@ -917,12 +982,21 @@ class SingleDirectionOffloadingHandler:
                 )
             self._xfer_last_call = now
         results: list[TransferResult] = []
-        while (
-            self._transfers
-            and self._transfers[0].submitted
-            and self._transfers[0].end_event.query()
-        ):
-            transfer = self._transfers.popleft()
+        if not self.gpu_to_cpu and self._mode()[0] == "queue" and self._q_srpt:
+            done = [t for t in self._transfers if t.submitted and t.end_event.query()]
+            if done:
+                self._transfers = deque(
+                    t for t in self._transfers if not any(t is d for d in done)
+                )
+        else:
+            done = []
+            while (
+                self._transfers
+                and self._transfers[0].submitted
+                and self._transfers[0].end_event.query()
+            ):
+                done.append(self._transfers.popleft())
+        for transfer in done:
             transfer_time = (
                 transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
             )  # elapsed_time is in milliseconds
@@ -937,10 +1011,11 @@ class SingleDirectionOffloadingHandler:
             if self._xfer_log is not None:
                 self._xfer_log.write(
                     '{"ev":"xfer","dir":"%s","job":%d,"bytes":%d,"ops":%d,'
-                    '"t_submit":%.4f,"t_detect":%.4f,"gpu_s":%.5f}\n'
+                    '"t_submit":%.4f,"t_detect":%.4f,"gpu_s":%.5f,'
+                    '"t_start_seen":%.4f,"t_end_seen":%.4f}\n'
                     % (self._xfer_dir, transfer.job_id, transfer.num_bytes,
                        transfer.num_ops, transfer.t_submit, time.time(),
-                       transfer_time)
+                       transfer_time, transfer.t_start_seen, transfer.t_end_seen)
                 )
             self._stream_pool.append(transfer.stream)
             self._event_pool.append(transfer.end_event)
@@ -952,8 +1027,9 @@ class SingleDirectionOffloadingHandler:
         return results
 
     def wait(self, job_ids: set[int]):
-        if any(not t.submitted for t in self._transfers):
-            self._pump(force=True)
+        with self._lock:
+            if any(not t.submitted for t in self._transfers):
+                self._pump(force=True)
         for job_id in job_ids:
             event = self._transfer_events.get(job_id)
             if event is not None:
@@ -961,8 +1037,9 @@ class SingleDirectionOffloadingHandler:
 
     def shutdown(self) -> None:
         """Drain this direction and release its transfer-side resources."""
-        if any(not t.submitted for t in self._transfers):
-            self._pump(force=True)
+        with self._lock:
+            if any(not t.submitted for t in self._transfers):
+                self._pump(force=True)
         sync_error: Exception | None = None
         while self._transfers:
             transfer = self._transfers[0]

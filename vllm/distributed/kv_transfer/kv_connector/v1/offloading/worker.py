@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+import time
 from collections import defaultdict
 from dataclasses import replace
 
@@ -36,6 +38,12 @@ from vllm.v1.kv_offload.base import (
 )
 
 logger = init_logger(__name__)
+# aris/layout-ctrlpath: job -> request mapping for VLLM_KV_XFER_LOG
+_XFER_LOG = (
+    open(os.environ["VLLM_KV_XFER_LOG"], "a", buffering=1)
+    if os.environ.get("VLLM_KV_XFER_LOG")
+    else None
+)
 
 
 class OffloadingConnectorWorker:
@@ -249,6 +257,11 @@ class OffloadingConnectorWorker:
 
         for job_id, entry in metadata.load_jobs.items():
             self._load_jobs[job_id] = entry.req_id
+            if _XFER_LOG is not None:
+                _XFER_LOG.write(
+                    '{"ev":"job","job":%d,"req":"%s","t":%.4f}\n'
+                    % (job_id, entry.req_id, time.time())
+                )
             assert isinstance(entry.dst_spec, GPULoadStoreSpec)
             success = self.worker.submit_load(job_id, entry.src_spec, entry.dst_spec)
             assert success
