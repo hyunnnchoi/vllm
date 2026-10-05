@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import os
 import time
 from collections import deque
 from collections.abc import Sequence
@@ -71,6 +72,13 @@ class Transfer:
     batch_src: torch.Tensor
     batch_dst: torch.Tensor
     batch_sizes: torch.Tensor
+    # Paced CPU->GPU submission (aris/layout-pacing): descriptors not yet
+    # submitted are src/dst/sizes[next_op:num_ops]; end_event is recorded only
+    # after the last chunk, so `submitted` guards queries on it.
+    num_ops: int = 0
+    next_op: int = 0
+    submitted: bool = True
+    is_src_access_order_any: bool = False
 
 
 def compute_sub_block_ptrs(
@@ -324,6 +332,19 @@ class SingleDirectionOffloadingHandler:
         num_scratch_blocks = gpu_tensors[0].shape[0] if canonical_layout else 0
         self._scratch_bases_src = np.empty(num_scratch_blocks, dtype=np.uint64)
         self._scratch_bases_dst = np.empty(num_scratch_blocks, dtype=np.uint64)
+
+        # Step-synchronous pacing of CPU->GPU loads (aris/layout-pacing).
+        # A DMA load that keeps the H2D copy engine busy starves the model
+        # runner's small per-step H2D input copies until it drains, so decode
+        # stalls for the whole load. With pacing, at most one chunk of at most
+        # VLLM_KV_LOAD_PACE_BYTES is in flight; the next chunk is submitted
+        # from get_finished(), i.e. once per engine step after the forward
+        # launch. VLLM_KV_LOAD_PACE_FILE (optional) holds the byte budget and
+        # is re-read when it changes. 0 disables pacing.
+        self._pace_bytes = int(os.environ.get("VLLM_KV_LOAD_PACE_BYTES", "0"))
+        self._pace_file = os.environ.get("VLLM_KV_LOAD_PACE_FILE") or None
+        self._pace_file_mtime = -1.0
+        self._pace_last_event: torch.Event | None = None
 
         # job_id -> event
         self._transfer_events: dict[int, torch.Event] = {}
@@ -653,16 +674,18 @@ class SingleDirectionOffloadingHandler:
         # writing; we must keep STREAM ordering so source reads are gated
         # by the transfer stream's wait_stream(compute) barrier.
         is_src_access_order_any = not self.gpu_to_cpu
+        paced = not self.gpu_to_cpu and self._pacing_budget() > 0 and op_idx > 0
         with current_platform.stream(stream):
             start_event.record(stream)
-            if op_idx > 0:
+            if op_idx > 0 and not paced:
                 self._swap_blocks_batch(
                     src,
                     dst,
                     sizes,
                     is_src_access_order_any=is_src_access_order_any,
                 )
-            end_event.record(stream)
+            if not paced:
+                end_event.record(stream)
 
         self._transfer_events[job_id] = end_event
         self._transfers.append(
@@ -675,15 +698,88 @@ class SingleDirectionOffloadingHandler:
                 batch_src=batch_src,
                 batch_dst=batch_dst,
                 batch_sizes=batch_sizes,
+                num_ops=op_idx,
+                next_op=0,
+                submitted=not paced,
+                is_src_access_order_any=is_src_access_order_any,
             )
         )
+        if paced:
+            self._pump()
 
         # success
         return True
 
+    def _pacing_budget(self) -> int:
+        if self._pace_file is not None:
+            try:
+                mtime = os.stat(self._pace_file).st_mtime
+                if mtime != self._pace_file_mtime:
+                    with open(self._pace_file) as f:
+                        self._pace_bytes = int(f.read().strip() or 0)
+                    self._pace_file_mtime = mtime
+            except (OSError, ValueError):
+                pass
+        return self._pace_bytes
+
+    def _pump(self, force: bool = False) -> None:
+        """Submit the next chunk of the oldest partially submitted load.
+
+        Without force: only if the previous chunk has finished (one chunk in
+        flight), and at most the pacing budget in bytes. With force: submit
+        everything that is left (used by wait() and shutdown())."""
+        pending = next((t for t in self._transfers if not t.submitted), None)
+        while pending is not None:
+            if not force and self._pace_last_event is not None:
+                if not self._pace_last_event.query():
+                    return
+            budget = self._pacing_budget()
+            sizes = pending.batch_sizes
+            start = pending.next_op
+            if force or budget <= 0:
+                end = pending.num_ops
+            else:
+                csum = np.cumsum(sizes[start:pending.num_ops].numpy())
+                end = start + max(1, int(np.searchsorted(csum, budget, side="right")))
+            with current_platform.stream(pending.stream):
+                if start == 0:
+                    # keep FIFO order with the previous load (its end_event was
+                    # not recorded when this transfer was created)
+                    prev = None
+                    for t in self._transfers:
+                        if t is pending:
+                            break
+                        prev = t
+                    if prev is not None:
+                        pending.stream.wait_event(prev.end_event)
+                self._swap_blocks_batch(
+                    pending.batch_src[start:end],
+                    pending.batch_dst[start:end],
+                    sizes[start:end],
+                    is_src_access_order_any=pending.is_src_access_order_any,
+                )
+                pending.next_op = end
+                if end >= pending.num_ops:
+                    pending.end_event.record(pending.stream)
+                    pending.submitted = True
+                    self._pace_last_event = pending.end_event
+                else:
+                    ev = torch.Event()
+                    ev.record(pending.stream)
+                    self._pace_last_event = ev
+            if not force:
+                return
+            pending = next((t for t in self._transfers if not t.submitted), None)
+
     def get_finished(self) -> list[TransferResult]:
+        if not self.gpu_to_cpu:
+            self._pump()
         results: list[TransferResult] = []
-        while self._transfers and self._transfers[0].end_event.query():
+        while (
+            self._transfers
+            and self._transfers[0].submitted
+            and self._transfers[0].end_event.query()
+        ):
             transfer = self._transfers.popleft()
             transfer_time = (
                 transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
@@ -706,6 +802,8 @@ class SingleDirectionOffloadingHandler:
         return results
 
     def wait(self, job_ids: set[int]):
+        if any(not t.submitted for t in self._transfers):
+            self._pump(force=True)
         for job_id in job_ids:
             event = self._transfer_events.get(job_id)
             if event is not None:
@@ -713,6 +811,8 @@ class SingleDirectionOffloadingHandler:
 
     def shutdown(self) -> None:
         """Drain this direction and release its transfer-side resources."""
+        if any(not t.submitted for t in self._transfers):
+            self._pump(force=True)
         sync_error: Exception | None = None
         while self._transfers:
             transfer = self._transfers[0]
