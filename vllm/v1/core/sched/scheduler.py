@@ -25,6 +25,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
+from vllm.v1.kv_offload.cpu import io_flags as _io_flags
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsManager,
 )
@@ -219,6 +220,10 @@ class Scheduler(SchedulerInterface):
 
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
+        # aris/layout-ctrlpath io_flags 'e'/'y': requests promoted from an early
+        # (monitor-thread) load completion, and loaded requests not yet scheduled
+        self._io_early: set[str] = set()
+        self._io_loaded: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
 
         # Grammar compilation failures to finish as per-request errors in
@@ -601,6 +606,42 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
+        io_fl = _io_flags.flags()
+        if "e" in io_fl:
+            for req_id in _io_flags.take_early_done():
+                req = self.requests.get(req_id)
+                if (
+                    req is not None
+                    and req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+                    and req_id not in self.failed_recving_kv_req_ids
+                    and req_id not in self.finished_recving_kv_req_ids
+                ):
+                    self.finished_recving_kv_req_ids.add(req_id)
+                    self._io_early.add(req_id)
+        if self._io_loaded:
+            self._io_loaded = {
+                i
+                for i in self._io_loaded
+                if i in self.requests
+                and self.requests[i].status
+                in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+            }
+        io_reserve, io_t_min = 0, None
+        if "y" in io_fl and (self.skipped_waiting or self._io_loaded):
+            for r in list(self.skipped_waiting) + list(self.waiting):
+                ready = (
+                    r.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+                    and r.request_id in self.finished_recving_kv_req_ids
+                    and r.request_id not in self.failed_recving_kv_req_ids
+                ) or (
+                    r.request_id in self._io_loaded
+                    and r.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+                )
+                if ready:
+                    io_reserve += max(1, r.num_tokens - r.num_computed_tokens)
+                    io_t_min = r.arrival_time if io_t_min is None else min(io_t_min, r.arrival_time)
+            io_reserve = min(io_reserve, token_budget)
+
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
         # all prefill compute unless saturated.
         defer_prefills = (
@@ -702,6 +743,14 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = self._reserve_prefill_lookahead(
                 request, request.num_computed_tokens, num_new_tokens
             )
+
+            if (
+                io_reserve > 0
+                and request.is_prefill_chunk
+                and request.arrival_time > io_t_min
+            ):
+                # an earlier request's KV load is done: leave it its tokens
+                num_new_tokens = max(0, min(num_new_tokens, token_budget - io_reserve))
 
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
@@ -2974,6 +3023,7 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.PREEMPTED
             else:
                 request.status = RequestStatus.WAITING
+            self._io_loaded.add(request.request_id)
             return True
 
         if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
@@ -3012,6 +3062,10 @@ class Scheduler(SchedulerInterface):
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
+            if req_id in self._io_early:
+                # already promoted from the monitor thread's early completion
+                self._io_early.discard(req_id)
+                continue
             assert req_id in self.requests
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:

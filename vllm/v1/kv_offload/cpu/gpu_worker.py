@@ -29,6 +29,7 @@ from vllm.v1.kv_offload.base import (
     TransferResult,
 )
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+from vllm.v1.kv_offload.cpu import io_flags as _io_flags
 from vllm.v1.kv_offload.cpu import swap_blocks_triton as _sbt
 from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
     THRESHOLD_BYTES,
@@ -712,8 +713,9 @@ class SingleDirectionOffloadingHandler:
         # the step being scheduled and cannot retract zeroing shipped in an
         # earlier step for a since-reallocated block; with async scheduling
         # nothing else orders that zeroing against this copy.
-        stream.wait_stream(current_platform.current_stream())
         mode, val = self._mode() if not self.gpu_to_cpu else ("stock", 0)
+        if self.gpu_to_cpu or "w" not in _io_flags.flags():
+            stream.wait_stream(current_platform.current_stream())
         srpt = mode == "queue" and self._q_srpt
         if self._transfers and not srpt:
             last_transfer: Transfer = self._transfers[-1]
@@ -789,7 +791,8 @@ class SingleDirectionOffloadingHandler:
                     if mode == "queue" and self._q_thread:
                         with self._lock:
                             self._pump_queue()
-                if self._xfer_log is not None:
+                early = not self.gpu_to_cpu and "e" in _io_flags.flags()
+                if self._xfer_log is not None or early:
                     with self._lock:
                         snap = list(self._transfers)
                     now = time.time()
@@ -798,6 +801,8 @@ class SingleDirectionOffloadingHandler:
                             t.t_start_seen = now
                         if t.submitted and t.t_end_seen == 0.0 and t.end_event.query():
                             t.t_end_seen = now
+                            if not self.gpu_to_cpu:
+                                _io_flags.job_done(t.job_id)
             except Exception as e:  # never kill the engine from here
                 logger.warning_once("kv-xfer-bg: %s", e)
             time.sleep(0.0005)
@@ -842,7 +847,7 @@ class SingleDirectionOffloadingHandler:
                 self._q_cap, self._q_chunk = cap, chunk
                 self._q_thread = "t" in flags
                 self._q_srpt = "s" in flags
-                if self._q_thread and not self.gpu_to_cpu:
+                if (self._q_thread or "e" in flags) and not self.gpu_to_cpu:
                     self._start_bg()
                 return "queue", cap
             if raw.startswith("triton"):

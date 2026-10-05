@@ -38,6 +38,8 @@ from vllm.v1.kv_offload.base import (
 )
 
 logger = init_logger(__name__)
+from vllm.v1.kv_offload.cpu import io_flags as _io_flags
+
 # aris/layout-ctrlpath: job -> request mapping for VLLM_KV_XFER_LOG
 _XFER_LOG = (
     open(os.environ["VLLM_KV_XFER_LOG"], "a", buffering=1)
@@ -257,6 +259,8 @@ class OffloadingConnectorWorker:
 
         for job_id, entry in metadata.load_jobs.items():
             self._load_jobs[job_id] = entry.req_id
+            if "e" in _io_flags.flags():
+                _io_flags.job_submitted(job_id, entry.req_id)
             if _XFER_LOG is not None:
                 _XFER_LOG.write(
                     '{"ev":"job","job":%d,"req":"%s","t":%.4f}\n'
