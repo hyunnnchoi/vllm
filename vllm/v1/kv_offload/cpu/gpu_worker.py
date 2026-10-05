@@ -80,6 +80,7 @@ class Transfer:
     next_op: int = 0
     submitted: bool = True
     is_src_access_order_any: bool = False
+    t_submit: float = 0.0
 
 
 def compute_sub_block_ptrs(
@@ -370,6 +371,15 @@ class SingleDirectionOffloadingHandler:
         self._pace_bw = float(os.environ.get("VLLM_KV_LOAD_PACE_BW", "12e9"))
         self._pace_step_s = 0.05
         self._pace_last_call: float | None = None
+        # VLLM_KV_XFER_LOG (optional): append one JSON line per finished
+        # transfer (wall-clock submit/detect time, bytes, GPU time) and one per
+        # gap of > 100 ms between get_finished() calls of the load handler
+        # (an engine step that took that long), to line up client-side
+        # inter-token gaps with KV loads.
+        xfer_log = os.environ.get("VLLM_KV_XFER_LOG")
+        self._xfer_log = open(xfer_log, "a", buffering=1) if xfer_log else None
+        self._xfer_dir = "store" if gpu_to_cpu else "load"
+        self._xfer_last_call: float | None = None
 
         # job_id -> event
         self._transfer_events: dict[int, torch.Event] = {}
@@ -732,6 +742,7 @@ class SingleDirectionOffloadingHandler:
                 next_op=0,
                 submitted=not paced,
                 is_src_access_order_any=is_src_access_order_any,
+                t_submit=time.time(),
             )
         )
         if paced:
@@ -894,6 +905,17 @@ class SingleDirectionOffloadingHandler:
         if not self.gpu_to_cpu:
             self._observe_step()
             self._pump()
+        if self._xfer_log is not None and not self.gpu_to_cpu:
+            now = time.time()
+            if self._xfer_last_call is not None and now - self._xfer_last_call > 0.1:
+                self._xfer_log.write(
+                    '{"ev":"gap","dir":"%s","t0":%.4f,"t1":%.4f,"inflight":%d,'
+                    '"inflight_bytes":%d}\n'
+                    % (self._xfer_dir, self._xfer_last_call, now,
+                       len(self._transfers),
+                       sum(t.num_bytes for t in self._transfers))
+                )
+            self._xfer_last_call = now
         results: list[TransferResult] = []
         while (
             self._transfers
@@ -912,6 +934,14 @@ class SingleDirectionOffloadingHandler:
             )
 
             results.append(result)
+            if self._xfer_log is not None:
+                self._xfer_log.write(
+                    '{"ev":"xfer","dir":"%s","job":%d,"bytes":%d,"ops":%d,'
+                    '"t_submit":%.4f,"t_detect":%.4f,"gpu_s":%.5f}\n'
+                    % (self._xfer_dir, transfer.job_id, transfer.num_bytes,
+                       transfer.num_ops, transfer.t_submit, time.time(),
+                       transfer_time)
+                )
             self._stream_pool.append(transfer.stream)
             self._event_pool.append(transfer.end_event)
             self._event_pool.append(transfer.start_event)
