@@ -358,6 +358,11 @@ class SingleDirectionOffloadingHandler:
         self._pace_file = os.environ.get("VLLM_KV_LOAD_PACE_FILE") or None
         self._pace_file_mtime = -1.0
         self._pace_last_event: torch.Event | None = None
+        # queue mode ("ctrlq:<cap>:<chunk>"): keep at most <cap> descriptors
+        # submitted-but-unfinished, submitting chunks of <chunk> descriptors,
+        # so cuMemcpyBatchAsync never waits for queue space (returns quickly)
+        # while the copy engine always has work.
+        self._q_chunks: deque = deque()
         # adaptive mode (budget < 0, e.g. -80): chunk = 0.80 x link bytes/s x
         # recent engine step time, step time = EWMA of the interval between
         # get_finished() calls (one per engine step); intervals under 5 ms are
@@ -695,7 +700,7 @@ class SingleDirectionOffloadingHandler:
         # by the transfer stream's wait_stream(compute) barrier.
         is_src_access_order_any = not self.gpu_to_cpu
         mode, val = self._mode() if not self.gpu_to_cpu else ("stock", 0)
-        paced = mode in ("pace", "pace_in", "adapt") and op_idx > 0
+        paced = mode in ("pace", "pace_in", "adapt", "queue") and op_idx > 0
         fn = self._swap_blocks_batch
         if mode == "triton" and self._triton_fn is not None:
             _sbt.NUM_SMS = val
@@ -768,6 +773,10 @@ class SingleDirectionOffloadingHandler:
                 pass
         raw = getattr(self, "_pace_raw", str(self._pace_bytes))
         try:
+            if raw.startswith("ctrlq:"):
+                cap, chunk = (int(v) for v in raw[6:].split(":"))
+                self._q_cap, self._q_chunk = cap, chunk
+                return "queue", cap
             if raw.startswith("triton"):
                 return "triton", int(raw[6:])
             if raw.startswith("in:"):
@@ -796,6 +805,9 @@ class SingleDirectionOffloadingHandler:
         Without force: only if the previous chunk has finished (one chunk in
         flight), and at most the pacing budget in bytes. With force: submit
         everything that is left (used by wait() and shutdown())."""
+        if not force and self._mode()[0] == "queue":
+            self._pump_queue()
+            return
         pending = next((t for t in self._transfers if not t.submitted), None)
         while pending is not None:
             if not force and self._pace_last_event is not None:
@@ -838,6 +850,45 @@ class SingleDirectionOffloadingHandler:
             if not force:
                 return
             pending = next((t for t in self._transfers if not t.submitted), None)
+
+    def _pump_queue(self) -> None:
+        while self._q_chunks and self._q_chunks[0][0].query():
+            self._q_chunks.popleft()
+        in_flight = sum(n for _, n in self._q_chunks)
+        while True:
+            pending = next((t for t in self._transfers if not t.submitted), None)
+            if pending is None:
+                return
+            start = pending.next_op
+            n = min(self._q_chunk, pending.num_ops - start)
+            if in_flight + n > self._q_cap and in_flight > 0:
+                return
+            end = start + n
+            with current_platform.stream(pending.stream):
+                if start == 0:
+                    prev = None
+                    for t in self._transfers:
+                        if t is pending:
+                            break
+                        prev = t
+                    if prev is not None:
+                        pending.stream.wait_event(prev.end_event)
+                self._swap_blocks_batch(
+                    pending.batch_src[start:end],
+                    pending.batch_dst[start:end],
+                    pending.batch_sizes[start:end],
+                    is_src_access_order_any=pending.is_src_access_order_any,
+                )
+                pending.next_op = end
+                if end >= pending.num_ops:
+                    pending.end_event.record(pending.stream)
+                    pending.submitted = True
+                    ev = pending.end_event
+                else:
+                    ev = torch.Event()
+                    ev.record(pending.stream)
+            self._q_chunks.append((ev, n))
+            in_flight += n
 
     def get_finished(self) -> list[TransferResult]:
         if not self.gpu_to_cpu:
