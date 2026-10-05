@@ -14,6 +14,7 @@ stay on the copy engine at full rate.
 Enable with VLLM_CTRL_UVA=1, or at runtime by writing a string that starts with
 "ctrl" into the file named by VLLM_KV_LOAD_PACE_FILE (re-read every 50 ms).
 """
+import collections
 import os
 import time
 
@@ -32,6 +33,11 @@ _FILE = os.environ.get("VLLM_KV_LOAD_PACE_FILE") or None
 _state = {"on": False, "checked": 0.0, "mtime": -1.0, "n": 0}
 _orig_copy = None
 _orig_to = None
+# The pinned caching host allocator only knows a block is in use by the GPU when
+# the copy goes through Tensor.copy_ (it records an event); our kernel bypasses
+# that, so hold both tensors until the kernel has run, or a freed temporary
+# (e.g. async_tensor_h2d's pinned staging tensor) is reused before the GPU reads it.
+_pending: collections.deque = collections.deque()
 
 
 if HAS_TRITON:
@@ -73,6 +79,11 @@ def _small(t: torch.Tensor) -> bool:
 def _launch(dst: torch.Tensor, src: torch.Tensor) -> None:
     nbytes = dst.numel() * dst.element_size()
     _uva_copy[(triton.cdiv(nbytes, BLOCK),)](src.data_ptr(), dst.data_ptr(), nbytes, BLOCK=BLOCK)
+    ev = torch.cuda.Event()
+    ev.record()
+    _pending.append((ev, src, dst))
+    while _pending and _pending[0][0].query():
+        _pending.popleft()
     _state["n"] += 1
     if _state["n"] in (1, 1000) or _state["n"] % 100000 == 0:
         logger.info("ctrl_uva: %d control copies through the SM kernel", _state["n"])
