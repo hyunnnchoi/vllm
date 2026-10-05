@@ -222,6 +222,10 @@ class Worker(WorkerBase):
         self.profiler: Any | None = None
         self.profiler_config = vllm_config.profiler_config
 
+        # aris/layout-ctrlpath: control copies off the copy engine (no-op unless enabled)
+        from vllm.v1.worker import ctrl_uva
+
+        ctrl_uva.install()
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
 
         # Device handles of the previous step's PP intermediate-tensor send.

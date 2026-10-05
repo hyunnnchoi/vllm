@@ -74,6 +74,8 @@ def _launch(dst: torch.Tensor, src: torch.Tensor) -> None:
     nbytes = dst.numel() * dst.element_size()
     _uva_copy[(triton.cdiv(nbytes, BLOCK),)](src.data_ptr(), dst.data_ptr(), nbytes, BLOCK=BLOCK)
     _state["n"] += 1
+    if _state["n"] in (1, 1000) or _state["n"] % 100000 == 0:
+        logger.info("ctrl_uva: %d control copies through the SM kernel", _state["n"])
 
 
 def _copy_(self, src, non_blocking=False, *args, **kwargs):
@@ -108,7 +110,8 @@ def _copy_(self, src, non_blocking=False, *args, **kwargs):
 def _to(self, *args, **kwargs):
     if (
         kwargs.get("non_blocking")
-        and set(kwargs) <= {"non_blocking", "device"}
+        and set(kwargs) <= {"non_blocking", "device", "dtype"}
+        and kwargs.get("dtype") in (None, self.dtype)
         and len(args) + ("device" in kwargs) == 1
         and _enabled()
         and not torch.cuda.is_current_stream_capturing()
@@ -134,8 +137,35 @@ def _to(self, *args, **kwargs):
     return _orig_to(self, *args, **kwargs)
 
 
+def _patch_v2_buffers() -> None:
+    """Model runner V2 stages step inputs in pinned UVA buffers and copies them
+    with ``out.copy_(uva_view)`` / ``uva_view.clone()``: a GPU-side view of host
+    memory, which the copy engine executes as an H2D copy. Route it through the
+    SM kernel too (the UVA view's address is the host address)."""
+    try:
+        from vllm.v1.worker.gpu import buffer_utils as bu
+    except Exception:
+        return
+    orig = bu.UvaBufferPool.copy_to_gpu
+
+    def copy_to_gpu(self, x, out=None):
+        if not _enabled() or torch.cuda.is_current_stream_capturing():
+            return orig(self, x, out)
+        uva = self.copy_to_uva(x)
+        try:
+            if _small(uva) and (out is None or (out.dtype == uva.dtype and out.numel() == uva.numel() and _small(out))):
+                dst = torch.empty(uva.shape, dtype=uva.dtype, device=uva.device) if out is None else out
+                _launch(dst, uva)
+                return dst
+        except Exception as e:
+            logger.warning_once("ctrl_uva v2 buffer fallback: %s", e)
+        return uva.clone() if out is None else _orig_copy(out, uva, True)
+
+    bu.UvaBufferPool.copy_to_gpu = copy_to_gpu
+
+
 def install() -> None:
-    """Patch Tensor.copy_ / Tensor.to in this process (idempotent)."""
+    """Patch Tensor.copy_ / Tensor.to (and the V2 UVA buffer pool) in this process (idempotent)."""
     global _orig_copy, _orig_to
     if _orig_copy is not None or not HAS_TRITON:
         return
@@ -145,6 +175,7 @@ def install() -> None:
     _orig_to = torch.Tensor.to
     torch.Tensor.copy_ = _copy_
     torch.Tensor.to = _to
+    _patch_v2_buffers()
     logger.info("ctrl_uva installed (env=%s, control file=%s)", _ENV_ON, _FILE)
 
 
