@@ -345,6 +345,13 @@ class SingleDirectionOffloadingHandler:
         self._pace_file = os.environ.get("VLLM_KV_LOAD_PACE_FILE") or None
         self._pace_file_mtime = -1.0
         self._pace_last_event: torch.Event | None = None
+        # adaptive mode (budget < 0, e.g. -80): chunk = 0.80 x link bytes/s x
+        # recent engine step time, step time = EWMA of the interval between
+        # get_finished() calls (one per engine step); intervals under 5 ms are
+        # idle spins (no forward) and count as 50 ms (load at full speed).
+        self._pace_bw = float(os.environ.get("VLLM_KV_LOAD_PACE_BW", "12e9"))
+        self._pace_step_s = 0.05
+        self._pace_last_call: float | None = None
 
         # job_id -> event
         self._transfer_events: dict[int, torch.Event] = {}
@@ -674,7 +681,7 @@ class SingleDirectionOffloadingHandler:
         # writing; we must keep STREAM ordering so source reads are gated
         # by the transfer stream's wait_stream(compute) barrier.
         is_src_access_order_any = not self.gpu_to_cpu
-        paced = not self.gpu_to_cpu and self._pacing_budget() > 0 and op_idx > 0
+        paced = not self.gpu_to_cpu and self._pacing_setting() != 0 and op_idx > 0
         with current_platform.stream(stream):
             start_event.record(stream)
             if op_idx > 0 and not paced:
@@ -711,6 +718,21 @@ class SingleDirectionOffloadingHandler:
         return True
 
     def _pacing_budget(self) -> int:
+        raw = self._pacing_setting()
+        if raw >= 0:
+            return raw
+        nbytes = (-raw / 100.0) * self._pace_bw * self._pace_step_s
+        return int(min(max(nbytes, 16 << 20), 1 << 30))
+
+    def _observe_step(self) -> None:
+        now = time.perf_counter()
+        if self._pace_last_call is not None:
+            dt = now - self._pace_last_call
+            dt = 0.05 if dt < 0.005 else min(dt, 1.0)
+            self._pace_step_s = 0.5 * self._pace_step_s + 0.5 * dt
+        self._pace_last_call = now
+
+    def _pacing_setting(self) -> int:
         if self._pace_file is not None:
             try:
                 mtime = os.stat(self._pace_file).st_mtime
@@ -736,7 +758,7 @@ class SingleDirectionOffloadingHandler:
             budget = self._pacing_budget()
             sizes = pending.batch_sizes
             start = pending.next_op
-            if force or budget <= 0:
+            if force or self._pacing_setting() == 0:
                 end = pending.num_ops
             else:
                 csum = np.cumsum(sizes[start:pending.num_ops].numpy())
@@ -773,6 +795,7 @@ class SingleDirectionOffloadingHandler:
 
     def get_finished(self) -> list[TransferResult]:
         if not self.gpu_to_cpu:
+            self._observe_step()
             self._pump()
         results: list[TransferResult] = []
         while (
