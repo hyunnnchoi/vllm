@@ -13,9 +13,20 @@ stay on the copy engine at full rate.
 
 Enable with VLLM_CTRL_UVA=1, or at runtime by writing a string that starts with
 "ctrl" into the file named by VLLM_KV_LOAD_PACE_FILE (re-read every 50 ms).
+
+VLLM_CTRL_TRACE=<path> (measurement): every host<->GPU copy that goes through
+Tensor.copy_ / Tensor.to / Tensor.cpu / UvaBufferPool.copy_to_gpu is bracketed
+by two timing events on the current stream and logged as one JSON line: wall
+time of the call, GPU time when the stream reached the copy (g0) and when the
+copy finished (g1), size, direction, call site, stream and whether the SM path
+was taken. g0 - t is the wait for earlier work on the same stream; g1 - g0 is
+the copy itself (including waiting for the copy engine).
 """
 import collections
+import json
 import os
+import sys
+import threading
 import time
 
 import torch
@@ -38,6 +49,84 @@ _orig_to = None
 # that, so hold both tensors until the kernel has run, or a freed temporary
 # (e.g. async_tensor_h2d's pinned staging tensor) is reused before the GPU reads it.
 _pending: collections.deque = collections.deque()
+
+_TRACE = os.environ.get("VLLM_CTRL_TRACE") or None
+_tr: dict = {"f": None, "ref": None, "t_ref": 0.0, "q": collections.deque(), "tl": threading.local()}
+
+
+def _trace_start() -> None:
+    if _tr["f"] is not None:
+        return
+    _tr["f"] = open(_TRACE, "a", buffering=1)
+    ref = torch.cuda.Event(enable_timing=True)
+    ref.record()
+    ref.synchronize()
+    _tr["ref"], _tr["t_ref"] = ref, time.time()
+    threading.Thread(target=_trace_loop, args=(torch.cuda.current_device(),), daemon=True,
+                     name="ctrl-uva-trace").start()
+    logger.info("ctrl_uva trace -> %s", _TRACE)
+
+
+def _trace_loop(dev: int) -> None:
+    torch.cuda.set_device(dev)
+    q, f, ref, t_ref = _tr["q"], _tr["f"], _tr["ref"], _tr["t_ref"]
+    while True:
+        try:
+            while q and q[0][1].query():
+                e0, e1, t, t_ret, op, d, nb, site, sid, sm = q.popleft()
+                g0 = t_ref + ref.elapsed_time(e0) / 1e3
+                g1 = t_ref + ref.elapsed_time(e1) / 1e3
+                f.write(json.dumps(dict(t=round(t, 5), t_ret=round(t_ret, 5), g0=round(g0, 5), g1=round(g1, 5), op=op,
+                                        dir=d, bytes=nb, site=site, stream=sid, sm=int(sm))) + "\n")
+        except Exception as e:  # never break the engine
+            logger.warning_once("ctrl_uva trace: %s", e)
+        time.sleep(0.002)
+
+
+def _site() -> str:
+    f = sys._getframe(2)
+    for _ in range(16):
+        if f is None:
+            break
+        fn = f.f_code.co_filename
+        if not fn.endswith("ctrl_uva.py") and "/torch/" not in fn:
+            return f"{fn.split('/vllm/')[-1]}:{f.f_lineno}:{f.f_code.co_name}"
+        f = f.f_back
+    return "?"
+
+
+def _traced(op: str, nbytes: int, d: str, call):
+    if not torch.cuda.is_available() or torch.cuda.is_current_stream_capturing():
+        return call()
+    _trace_start()
+    s = torch.cuda.current_stream()
+    e0 = torch.cuda.Event(enable_timing=True)
+    e1 = torch.cuda.Event(enable_timing=True)
+    tl = _tr["tl"]
+    tl.sm = False
+    site = _site()
+    t = time.time()
+    e0.record(s)
+    out = call()
+    e1.record(s)
+    _tr["q"].append((e0, e1, t, time.time(), op, d, nbytes, site, s.stream_id, getattr(tl, "sm", False)))
+    return out
+
+
+def _target_dev(args, kwargs):
+    dev = kwargs.get("device")
+    if dev is None and args:
+        a0 = args[0]
+        if isinstance(a0, torch.Tensor):
+            return a0.device
+        if isinstance(a0, (str, torch.device, int)):
+            dev = a0
+    if dev is None:
+        return None
+    try:
+        return torch.device("cuda", dev) if isinstance(dev, int) else torch.device(dev)
+    except Exception:
+        return None
 
 
 if HAS_TRITON:
@@ -82,6 +171,7 @@ def _small(t: torch.Tensor) -> bool:
 
 
 def _launch(dst: torch.Tensor, src: torch.Tensor) -> None:
+    _tr["tl"].sm = True
     nbytes = dst.numel() * dst.element_size()
     _uva_copy[(triton.cdiv(nbytes, BLOCK),)](src.data_ptr(), dst.data_ptr(), nbytes, BLOCK=BLOCK)
     ev = torch.cuda.Event()
@@ -153,6 +243,37 @@ def _to(self, *args, **kwargs):
     return _orig_to(self, *args, **kwargs)
 
 
+def _copy_traced(self, src, non_blocking=False, *args, **kwargs):
+    if isinstance(src, torch.Tensor) and self.device.type != src.device.type:
+        d = "h2d" if self.device.type == "cuda" else "d2h"
+        return _traced("copy_", self.numel() * self.element_size(), d,
+                       lambda: _copy_(self, src, non_blocking, *args, **kwargs))
+    return _copy_(self, src, non_blocking, *args, **kwargs)
+
+
+def _to_traced(self, *args, **kwargs):
+    dev = _target_dev(args, kwargs)
+    if dev is not None and dev.type != self.device.type and {dev.type, self.device.type} == {"cpu", "cuda"}:
+        d = "h2d" if dev.type == "cuda" else "d2h"
+        return _traced(".to", self.numel() * self.element_size(), d, lambda: _to(self, *args, **kwargs))
+    return _to(self, *args, **kwargs)
+
+
+_orig_cpu = None
+
+
+def _cpu_traced(self, *args, **kwargs):
+    if self.is_cuda:
+        return _traced(".cpu", self.numel() * self.element_size(), "d2h", lambda: _orig_cpu(self, *args, **kwargs))
+    return _orig_cpu(self, *args, **kwargs)
+
+
+def _nbytes(x) -> int:
+    if isinstance(x, torch.Tensor):
+        return x.numel() * x.element_size()
+    return int(getattr(x, "nbytes", 0) or (len(x) * 4 if isinstance(x, (list, tuple)) else 0))
+
+
 def _patch_v2_buffers() -> None:
     """Model runner V2 stages step inputs in pinned UVA buffers and copies them
     with ``out.copy_(uva_view)`` / ``uva_view.clone()``: a GPU-side view of host
@@ -177,20 +298,34 @@ def _patch_v2_buffers() -> None:
             logger.warning_once("ctrl_uva v2 buffer fallback: %s", e)
         return uva.clone() if out is None else _orig_copy(out, uva, True)
 
-    bu.UvaBufferPool.copy_to_gpu = copy_to_gpu
+    if _TRACE is not None:
+        inner = copy_to_gpu
+
+        def copy_to_gpu_traced(self, x, out=None):
+            return _traced("uva_pool", _nbytes(x), "h2d", lambda: inner(self, x, out))
+
+        bu.UvaBufferPool.copy_to_gpu = copy_to_gpu_traced
+    else:
+        bu.UvaBufferPool.copy_to_gpu = copy_to_gpu
 
 
 def install() -> None:
     """Patch Tensor.copy_ / Tensor.to (and the V2 UVA buffer pool) in this process (idempotent)."""
-    global _orig_copy, _orig_to
+    global _orig_copy, _orig_to, _orig_cpu
     if _orig_copy is not None or not HAS_TRITON:
         return
     if not (_ENV_ON or _FILE):
         return
     _orig_copy = torch.Tensor.copy_
     _orig_to = torch.Tensor.to
-    torch.Tensor.copy_ = _copy_
-    torch.Tensor.to = _to
+    if _TRACE is not None:
+        _orig_cpu = torch.Tensor.cpu
+        torch.Tensor.copy_ = _copy_traced
+        torch.Tensor.to = _to_traced
+        torch.Tensor.cpu = _cpu_traced
+    else:
+        torch.Tensor.copy_ = _copy_
+        torch.Tensor.to = _to
     _patch_v2_buffers()
     logger.info("ctrl_uva installed (env=%s, control file=%s)", _ENV_ON, _FILE)
 
