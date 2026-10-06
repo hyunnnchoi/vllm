@@ -594,6 +594,9 @@ class OffloadingConnectorScheduler:
         # active jobs.
         self._stale_job_threshold: int = 0
         self._jobs: dict[int, TransferJobStatus] = {}
+        # aris/layout-ctrlpath io_flags 'e': load jobs settled early from the
+        # worker's monitor thread; their regular completion is skipped
+        self._early_completed_jobs: set[int] = set()
 
         # block_id -> pending store job_ids. Used to track jobs that needs
         # flushing in case a block is re-allocated by the KV cache manager.
@@ -1847,6 +1850,9 @@ class OffloadingConnectorScheduler:
 
         for job_id, count in meta.completed_jobs.items():
             assert count > 0
+            if job_id in self._early_completed_jobs:
+                self._early_completed_jobs.discard(job_id)
+                continue
             if job_id < self._stale_job_threshold:
                 logger.debug(
                     "Skipping stale completed job %d (pre-reset counter: %d)",
@@ -1882,6 +1888,23 @@ class OffloadingConnectorScheduler:
             req_status.transfer_jobs.remove(job_id)
             if req_status.finished_signaled and not req_status.transfer_jobs:
                 del self._req_status[job_status.req_id]
+
+    def early_complete_load(self, req_id: str) -> None:
+        """aris io_flags 'e': the worker saw this request's loads finish;
+        settle them now so store jobs for its new tokens can be built."""
+        req_status = self._req_status.get(req_id)
+        if req_status is None:
+            return
+        for job_id in [j for j in req_status.transfer_jobs if not self._jobs[j].is_store]:
+            job_status = self._jobs[job_id]
+            self.manager.complete_load(job_status.keys, req_status.req_context)
+            if self._chunks_being_loaded:
+                self._chunks_being_loaded.difference_update(job_status.keys)
+            if self._block_id_to_pending_jobs:
+                self._remove_pending_job(job_id, job_status.fenced_block_ids)
+            del self._jobs[job_id]
+            req_status.transfer_jobs.remove(job_id)
+            self._early_completed_jobs.add(job_id)
 
     def get_stats(self) -> OffloadingConnectorStats | None:
         stats: OffloadingConnectorStats | None = None

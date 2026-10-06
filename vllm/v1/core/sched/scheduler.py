@@ -618,6 +618,9 @@ class Scheduler(SchedulerInterface):
                 ):
                     self.finished_recving_kv_req_ids.add(req_id)
                     self._io_early.add(req_id)
+                    cs = getattr(self.connector, "connector_scheduler", None)
+                    if cs is not None and hasattr(cs, "early_complete_load"):
+                        cs.early_complete_load(req_id)
         if self._io_loaded:
             self._io_loaded = {
                 i

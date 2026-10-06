@@ -65,7 +65,12 @@ def _enabled() -> bool:
             if mtime != _state["mtime"]:
                 _state["mtime"] = mtime
                 with open(_FILE) as f:
-                    _state["on"] = f.read().strip().startswith("ctrl")
+                    raw = f.read().strip()
+                parts = raw.split(":")
+                # 'n' in a ctrlq flags field turns the SM control path off
+                _state["on"] = raw.startswith("ctrl") and not (
+                    raw.startswith("ctrlq:") and len(parts) > 3 and "n" in parts[3]
+                )
         except OSError:
             pass
     return _state["on"]
