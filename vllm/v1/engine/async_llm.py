@@ -45,6 +45,7 @@ from vllm.utils.async_utils import cancel_task_threadsafe
 from vllm.utils.collection_utils import as_list
 from vllm.v1.engine import EngineCoreRequest, PauseMode
 from vllm.v1.engine.admission_control import SharedAdmissionStats
+from vllm.v1.engine import loop_log
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.v1.engine.input_processor import InputProcessor
@@ -787,6 +788,7 @@ class AsyncLLM(EngineClient):
                 while True:
                     # 1) Pull EngineCoreOutputs from the EngineCore.
                     outputs = await engine_core.get_output_async()
+                    _t0 = time.time()
                     num_outputs = len(outputs.outputs)
 
                     iteration_stats = (
@@ -827,6 +829,16 @@ class AsyncLLM(EngineClient):
                                 processed_outputs.reqs_to_abort
                             )
 
+                    if loop_log.enabled() and num_outputs:
+                        loop_log.log(
+                            "fe",
+                            _t0,
+                            time.time(),
+                            n=num_outputs,
+                            fin=sum(
+                                o.finish_reason is not None for o in outputs.outputs
+                            ),
+                        )
                     output_processor.update_scheduler_stats(outputs.scheduler_stats)
 
                     # 4) Logging.
@@ -844,6 +856,17 @@ class AsyncLLM(EngineClient):
                 output_processor.propagate_error(e)
 
         self.output_handler = asyncio.create_task(output_handler())
+
+        async def loop_lag_monitor():
+            while True:
+                t = time.time()
+                await asyncio.sleep(0.001)
+                late = time.time() - t - 0.001
+                if late > 0.005:
+                    loop_log.log("lag", t, time.time(), late=late)
+
+        if loop_log.enabled():
+            self._loop_lag_task = asyncio.create_task(loop_lag_monitor())
 
     async def abort(
         self, request_id: str | Iterable[str], internal: bool = False

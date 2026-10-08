@@ -72,6 +72,7 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1.engine import loop_log
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -604,16 +605,28 @@ class EngineCore:
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
         ):
+            _t0 = time.time()
             model_output = future.result()
+            loop_log.log("wait", _t0, time.time())
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        _t0 = time.time()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if loop_log.enabled():
+            outs = [o for eco in engine_core_outputs.values() for o in eco.outputs]
+            loop_log.log(
+                "upd",
+                _t0,
+                time.time(),
+                n=len(outs),
+                fin=sum(o.finish_reason is not None for o in outs),
+            )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
@@ -655,10 +668,21 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
+            _t0 = time.time()
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            _t1 = time.time()
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
+                )
+            if loop_log.enabled():
+                loop_log.log(
+                    "sched",
+                    _t0,
+                    time.time(),
+                    t_sched=_t1,
+                    tok=scheduler_output.total_num_scheduled_tokens,
+                    new=len(scheduler_output.scheduled_new_reqs),
                 )
             if self.is_ec_consumer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
@@ -703,7 +727,9 @@ class EngineCore:
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
         ):
+            _t0 = time.time()
             model_output = future.result()
+            loop_log.log("wait", _t0, time.time())
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
@@ -713,9 +739,19 @@ class EngineCore:
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        _t0 = time.time()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if loop_log.enabled():
+            outs = [o for eco in engine_core_outputs.values() for o in eco.outputs]
+            loop_log.log(
+                "upd",
+                _t0,
+                time.time(),
+                n=len(outs),
+                fin=sum(o.finish_reason is not None for o in outs),
+            )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
@@ -1443,7 +1479,9 @@ class EngineCoreProc(EngineCore):
             block = self.process_input_queue_block
             try:
                 req = self.input_queue.get(block=block)
+                _t0 = time.time()
                 self._handle_client_request(*req)
+                loop_log.log("req", _t0, time.time(), kind=str(req[0]))
             except queue.Empty:
                 break
             if not block:
@@ -1455,7 +1493,9 @@ class EngineCoreProc(EngineCore):
         # Handle any more client requests.
         while not self.input_queue.empty():
             req = self.input_queue.get_nowait()
+            _t0 = time.time()
             self._handle_client_request(*req)
+            loop_log.log("req", _t0, time.time(), kind=str(req[0]))
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
@@ -1754,9 +1794,18 @@ class EngineCoreProc(EngineCore):
                     # Deserialize the request data.
                     request: Any
                     if request_type == EngineCoreRequestType.ADD:
+                        _t0 = time.time()
                         req: EngineCoreRequest = add_request_decoder.decode(data_frames)
+                        _t1 = time.time()
                         try:
                             request = self.preprocess_add_request(req)
+                            loop_log.log(
+                                "in_add",
+                                _t0,
+                                time.time(),
+                                t_dec=_t1,
+                                ntok=len(req.prompt_token_ids or ()),
+                            )
                         except MultiModalCacheMissError as e:
                             # P0/P1 shadow drift -- return a retryable signal (P0
                             # drops the stale entry, client resends with data).
@@ -1844,11 +1893,20 @@ class EngineCoreProc(EngineCore):
                     if len(reuse_buffers) < max_reuse_bufs:
                         reuse_buffers.append(reclaimed)
 
+                _t0 = time.time()
                 buffer = reuse_buffers.pop() if reuse_buffers else bytearray()
                 buffers = encoder.encode_into(outputs, buffer)
                 tracker = self._send_msg_tracking_payload(
                     sockets[client_index], buffers
                 )
+                if loop_log.enabled():
+                    loop_log.log(
+                        "send",
+                        _t0,
+                        time.time(),
+                        n=len(outputs.outputs),
+                        fin=sum(o.finish_reason is not None for o in outputs.outputs),
+                    )
                 if not tracker.done:
                     pending.appendleft((tracker, buffer))
                 elif len(reuse_buffers) < max_reuse_bufs:
