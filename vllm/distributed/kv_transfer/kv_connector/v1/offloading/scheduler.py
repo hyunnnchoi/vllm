@@ -1136,7 +1136,10 @@ class OffloadingConnectorScheduler:
             load_start_gpu_block_idx = num_gpu_blocks
             for i in range(first_fresh_gpu_block_idx, num_gpu_blocks):
                 block = group_blocks[i]
-                if not block.is_null and block.block_hash is None:
+                # aris layer-wise: a sync load's blocks are cached (hashed) at
+                # allocation, so every non-null block past the computed boundary
+                # is to be loaded
+                if not block.is_null and (_LAYERWISE or block.block_hash is None):
                     load_start_gpu_block_idx = i
                     break
 
