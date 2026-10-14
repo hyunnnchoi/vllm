@@ -607,7 +607,7 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.new_step_starts()
 
         io_fl = _io_flags.flags()
-        if "e" in io_fl:
+        if "e" in io_fl or _io_flags.LW_ASYNC:
             for req_id in _io_flags.take_early_done():
                 req = self.requests.get(req_id)
                 if (
@@ -619,7 +619,13 @@ class Scheduler(SchedulerInterface):
                     self.finished_recving_kv_req_ids.add(req_id)
                     self._io_early.add(req_id)
                     cs = getattr(self.connector, "connector_scheduler", None)
-                    if cs is not None and hasattr(cs, "early_complete_load"):
+                    # Baton-style layer-wise: only layer 0 has arrived; the load job
+                    # stays pending until the worker reports it complete
+                    if (
+                        cs is not None
+                        and hasattr(cs, "early_complete_load")
+                        and not _io_flags.LW_ASYNC
+                    ):
                         cs.early_complete_load(req_id)
         if self._io_loaded:
             self._io_loaded = {

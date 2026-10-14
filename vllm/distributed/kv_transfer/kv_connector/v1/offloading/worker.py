@@ -277,6 +277,20 @@ class OffloadingConnectorWorker:
         self._unsubmitted_store_jobs.clear()
 
         for job_id, entry in metadata.load_jobs.items():
+            if _cpu_gw.LAYERWISE_ASYNC:
+                self._load_jobs[job_id] = entry.req_id
+                _io_flags.job_submitted(job_id, entry.req_id)
+                if _XFER_LOG is not None:
+                    _XFER_LOG.write(
+                        '{"ev":"job","job":%d,"req":"%s","t":%.4f,"lw":2}\n'
+                        % (job_id, entry.req_id, time.time())
+                    )
+                assert isinstance(entry.dst_spec, GPULoadStoreSpec)
+                success = self.worker.submit_load_layerwise_async(
+                    job_id, entry.src_spec, entry.dst_spec
+                )
+                assert success
+                continue
             if _cpu_gw.LAYERWISE:
                 self._layerwise_jobs.add(job_id)
                 if _XFER_LOG is not None:
@@ -354,10 +368,18 @@ class OffloadingConnectorWorker:
 
         return set(), finished_recving
 
-    def wait_for_layer_load(self, layer_name: str) -> None:
+    def wait_for_layer_load(self, layer_name: str, compute_jobs=None) -> None:
         """aris layer-wise: make the current (compute) stream wait for this layer's
-        in-step loads."""
+        in-step loads (sync mode) or for this layer of the loads of the requests
+        computed in this step (Baton-style mode)."""
         from vllm.v1.kv_offload.cpu import gpu_worker as _cpu_gw
+
+        if _cpu_gw.LAYERWISE_ASYNC:
+            if compute_jobs:
+                stream = torch.cuda.current_stream()
+                for job_id in compute_jobs:
+                    _cpu_gw.wait_layer(job_id, layer_name, stream)
+            return
 
         events = _cpu_gw.LAYER_EVENTS.pop(layer_name, None)
         if events:

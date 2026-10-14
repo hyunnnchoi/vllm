@@ -74,6 +74,34 @@ REF_LAYER_NAMES: list[list[str]] = []
 # layer name -> events of this step's layer-wise loads (consumed by wait_for_layer_load)
 LAYER_EVENTS: dict[str, list] = {}
 
+# aris Baton-style layer-wise offload (VLLM_KV_OFFLOAD_LAYERWISE=2), after the layer-wise
+# H2D of /home/work/yhgo/baton-incremental-v023 (load path only; no LAS scheduler, no
+# prediction or speculative prefetch). A CPU-tier load stays asynchronous (submitted after
+# the forward is launched), but the background thread submits it one layer at a time in
+# layer order with at most LW_WINDOW layers in flight, publishing an event per layer. When
+# layer 0 has arrived the request is reported to the scheduler (io_flags early completion)
+# and runs in the next step; that step's forward waits per layer only for the loads of the
+# requests it computes (wait_layer), so the rest of the transfer overlaps the forward.
+LAYERWISE_ASYNC = os.environ.get("VLLM_KV_OFFLOAD_LAYERWISE", "0") == "2"
+LW_WINDOW = int(os.environ.get("VLLM_KV_OFFLOAD_LW_WINDOW", "2"))
+LW_JOBS: dict[int, "Transfer"] = {}
+LW_COND = threading.Condition()
+
+
+def wait_layer(job_id: int, layer_name: str, stream) -> None:
+    """Make `stream` wait for `layer_name` of layer-wise load `job_id` (host waits only
+    until the background thread has submitted that layer)."""
+    t = LW_JOBS.get(job_id)
+    if t is None or t.layer_events is None:
+        return
+    deadline = time.monotonic() + 60.0
+    with LW_COND:
+        while layer_name not in t.layer_events and not t.submitted:
+            if not LW_COND.wait(timeout=0.05) and time.monotonic() > deadline:
+                raise RuntimeError(f"layer-wise load {job_id}: {layer_name} never published")
+        ev = t.layer_events.get(layer_name)
+    stream.wait_event(ev if ev is not None else t.end_event)
+
 
 @dataclass
 class Transfer:
@@ -96,6 +124,12 @@ class Transfer:
     # wall-clock times when the monitor thread first saw start/end complete
     t_start_seen: float = 0.0
     t_end_seen: float = 0.0
+    # Baton-style layer-wise load: [layer name, first op, end op] per layer, the
+    # published per-layer events, the next layer to submit, layer 0 seen complete
+    layer_groups: list | None = None
+    layer_events: dict | None = None
+    layer_next: int = 0
+    first_ready: bool = False
 
 
 def compute_sub_block_ptrs(
@@ -413,6 +447,7 @@ class SingleDirectionOffloadingHandler:
         self._transfer_events: dict[int, torch.Event] = {}
         # queue of transfers (job_id, stream, event)
         self._transfers: deque[Transfer] = deque()
+        self._lw_inflight: deque = deque()
         # list of CUDA streams available for re-use
         self._stream_pool: list[torch.cuda.Stream] = []
         # list of CUDA events available for re-use
@@ -608,6 +643,7 @@ class SingleDirectionOffloadingHandler:
     ) -> bool:
         assert isinstance(src_spec, BlockIDsLoadStoreSpec)
         layerwise = layerwise and not self.gpu_to_cpu
+        lw_async = layerwise == "async"
         self._ref_ends = [] if layerwise else None
         assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
 
@@ -753,6 +789,16 @@ class SingleDirectionOffloadingHandler:
         # by the transfer stream's wait_stream(compute) barrier.
         is_src_access_order_any = not self.gpu_to_cpu
         paced = mode in ("pace", "pace_in", "adapt", "queue") and op_idx > 0 and not layerwise
+        layer_groups = None
+        if lw_async:
+            layer_groups, prev = [], 0
+            for g_idx, r_idx, end in self._ref_ends:
+                name = REF_LAYER_NAMES[g_idx][r_idx]
+                if layer_groups and layer_groups[-1][0] == name and layer_groups[-1][2] == prev:
+                    layer_groups[-1][2] = end
+                else:
+                    layer_groups.append([name, prev, end])
+                prev = end
         fn = self._swap_blocks_batch
         if mode == "triton" and self._triton_fn is not None and not layerwise:
             _sbt.NUM_SMS = val
@@ -760,7 +806,9 @@ class SingleDirectionOffloadingHandler:
         t_call = time.time()   # before the copy call (a large batch call blocks)
         with current_platform.stream(stream):
             start_event.record(stream)
-            if layerwise:
+            if lw_async:
+                pass  # layers are submitted by the background thread (_pump_layers)
+            elif layerwise:
                 # one copy batch per ref (= per KV-cache layer), an event after each
                 prev = 0
                 for g_idx, r_idx, end in self._ref_ends:
@@ -782,7 +830,7 @@ class SingleDirectionOffloadingHandler:
                     sizes,
                     is_src_access_order_any=is_src_access_order_any,
                 )
-            if not paced:
+            if not paced and not (lw_async and layer_groups):
                 end_event.record(stream)
         self._ref_ends = None
 
@@ -800,11 +848,18 @@ class SingleDirectionOffloadingHandler:
                 batch_sizes=batch_sizes,
                 num_ops=op_idx,
                 next_op=0,
-                submitted=not paced,
+                submitted=not paced and not (lw_async and layer_groups),
                 is_src_access_order_any=is_src_access_order_any,
                 t_submit=t_call,
+                layer_groups=layer_groups if lw_async and layer_groups else None,
+                layer_events={} if lw_async and layer_groups else None,
             )
         )
+        if lw_async:
+            LW_JOBS[job_id] = self._transfers[-1]
+            if not layer_groups:   # nothing to copy: report at once
+                _io_flags.job_done(job_id)
+            self._start_bg()
         try:
             if paced:
                 self._pump()
@@ -830,6 +885,9 @@ class SingleDirectionOffloadingHandler:
                     if mode == "queue" and self._q_thread:
                         with self._lock:
                             self._pump_queue()
+                    if LAYERWISE_ASYNC:
+                        with self._lock:
+                            self._pump_layers()
                 early = not self.gpu_to_cpu and "e" in _io_flags.flags()
                 if self._xfer_log is not None or early:
                     with self._lock:
@@ -845,6 +903,48 @@ class SingleDirectionOffloadingHandler:
             except Exception as e:  # never kill the engine from here
                 logger.warning_once("kv-xfer-bg: %s", e)
             time.sleep(0.0005)
+
+    def _pump_layers(self) -> None:
+        """Baton-style layer-wise load: submit layers in order, <= LW_WINDOW in flight,
+        publish one event per layer, report layer-0 readiness to the scheduler."""
+        lw = [t for t in self._transfers if t.layer_groups is not None]
+        if not lw:
+            return
+        for t in lw:
+            if not t.first_ready and t.layer_events:
+                ev0 = t.layer_events.get(t.layer_groups[0][0])
+                if ev0 is not None and ev0.query():
+                    t.first_ready = True
+                    _io_flags.job_done(t.job_id)
+        while self._lw_inflight and self._lw_inflight[0].query():
+            self._lw_inflight.popleft()
+        published = False
+        while len(self._lw_inflight) < LW_WINDOW:
+            t = next((x for x in lw if x.layer_next < len(x.layer_groups)), None)
+            if t is None:
+                break
+            name, a, b = t.layer_groups[t.layer_next]
+            with current_platform.stream(t.stream):
+                if b > a:
+                    self._swap_blocks_batch(
+                        t.batch_src[a:b],
+                        t.batch_dst[a:b],
+                        t.batch_sizes[a:b],
+                        is_src_access_order_any=t.is_src_access_order_any,
+                    )
+                ev = torch.Event()
+                ev.record(t.stream)
+                t.layer_next += 1
+                if t.layer_next == len(t.layer_groups):
+                    t.end_event.record(t.stream)
+                    t.submitted = True
+            with LW_COND:
+                t.layer_events[name] = ev
+            self._lw_inflight.append(ev)
+            published = True
+        if published:
+            with LW_COND:
+                LW_COND.notify_all()
 
     def _pacing_budget(self) -> int:
         mode, val = self._mode()
@@ -920,8 +1020,17 @@ class SingleDirectionOffloadingHandler:
         if not force and self._mode()[0] == "queue":
             self._pump_queue()
             return
-        pending = next((t for t in self._transfers if not t.submitted), None)
+        pending = next(
+            (t for t in self._transfers
+             if not t.submitted and (force or t.layer_groups is None)),
+            None,
+        )
         while pending is not None:
+            if pending.layer_groups is not None:
+                # forced drain of a layer-wise load: submit what is left at once
+                lg, k = pending.layer_groups, pending.layer_next
+                pending.next_op = lg[k][1] if k < len(lg) else pending.num_ops
+                pending.layer_next = len(lg)
             if not force and self._pace_last_event is not None:
                 if not self._pace_last_event.query():
                     return
@@ -1041,6 +1150,7 @@ class SingleDirectionOffloadingHandler:
             ):
                 done.append(self._transfers.popleft())
         for transfer in done:
+            LW_JOBS.pop(transfer.job_id, None)
             transfer_time = (
                 transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
             )  # elapsed_time is in milliseconds
@@ -1206,6 +1316,14 @@ class CPUOffloadingWorker(OffloadingWorker):
     ) -> bool:
         """Async CPU -> GPU."""
         return self._load_handler.transfer_async(job_id, src_spec, dst_spec)
+
+    def submit_load_layerwise_async(
+        self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec
+    ) -> bool:
+        """Baton-style CPU -> GPU, layers submitted by the background thread."""
+        return self._load_handler.transfer_async(
+            job_id, src_spec, dst_spec, layerwise="async"
+        )
 
     def submit_load_layerwise(
         self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec

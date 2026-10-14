@@ -64,6 +64,8 @@ logger = init_logger(__name__)
 
 # aris layer-wise offload: CPU-tier hits are loaded inside the scheduling step (sync)
 _LAYERWISE = os.environ.get("VLLM_KV_OFFLOAD_LAYERWISE", "0") == "1"
+# aris Baton-style layer-wise (async loads, promotion at layer 0, per-layer waits)
+_LW_ASYNC = os.environ.get("VLLM_KV_OFFLOAD_LAYERWISE", "0") == "2"
 
 KV_LOAD_TIERS_KEY = "kv_load_tiers"
 MATCHER_MEDIUM_KEY = "medium"
@@ -604,6 +606,12 @@ class OffloadingConnectorScheduler:
         # aris layer-wise: requests whose in-step loads were issued by the previous
         # scheduling step; settled at the next build_connector_meta (see there)
         self._lw_settle_next: list[str] = []
+        # aris Baton-style layer-wise: requests that have been scheduled while their
+        # load was still in flight (promoted at layer 0). Every forward waits for the
+        # remaining layers of these loads until they complete, even if the request was
+        # preempted meanwhile (its blocks may be reused) or its now-cached blocks are
+        # read by another request.
+        self._lw_admitted: set[str] = set()
 
         # block_id -> pending store job_ids. Used to track jobs that needs
         # flushing in case a block is re-allocated by the KV cache manager.
@@ -1724,7 +1732,7 @@ class OffloadingConnectorScheduler:
             # in-step load is complete before any store built now runs on the GPU
             # (stores are submitted at the next step, after the load step's forward,
             # which waits for every layer), so a pending layer-wise load is allowed.
-            if req_status.transfer_jobs and not _LAYERWISE:
+            if req_status.transfer_jobs and not (_LAYERWISE or _LW_ASYNC):
                 any_jid = next(iter(req_status.transfer_jobs))
                 assert self._jobs[any_jid].is_store
             req_status.transfer_jobs.add(job_id)
@@ -1798,7 +1806,7 @@ class OffloadingConnectorScheduler:
             if req_status is None or not req_status.transfer_jobs:
                 continue
             any_jid = next(iter(req_status.transfer_jobs))
-            assert _LAYERWISE or self._jobs[any_jid].is_store
+            assert _LAYERWISE or _LW_ASYNC or self._jobs[any_jid].is_store
             self._current_batch_jobs_to_flush.update(
                 j for j in req_status.transfer_jobs if self._jobs[j].is_store
             )
@@ -1819,10 +1827,28 @@ class OffloadingConnectorScheduler:
 
         partial_store_jobs = self._build_partial_tail_store_jobs(scheduler_output)
         normal_store_jobs = self._build_store_jobs(scheduler_output)
+        compute_jobs = None
+        if _LW_ASYNC:
+            req_ids = [r.req_id for r in scheduler_output.scheduled_new_reqs]
+            req_ids += list(scheduler_output.scheduled_cached_reqs.req_ids)
+            self._lw_admitted.update(req_ids)
+            compute_jobs = set()
+            for rid in list(self._lw_admitted):
+                rs = self._req_status.get(rid)
+                jobs = (
+                    [j for j in rs.transfer_jobs if not self._jobs[j].is_store]
+                    if rs is not None
+                    else []
+                )
+                if jobs:
+                    compute_jobs.update(jobs)
+                else:
+                    self._lw_admitted.discard(rid)
         meta = OffloadingConnectorMetadata(
             load_jobs=self._current_batch_load_jobs,
             store_jobs=partial_store_jobs | normal_store_jobs,
             jobs_to_flush=self._current_batch_jobs_to_flush,
+            compute_jobs=compute_jobs,
         )
 
         # All prepare_store calls for finished requests have been issued.

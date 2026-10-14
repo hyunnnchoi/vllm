@@ -70,6 +70,9 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
     load_jobs: dict[int, TransferJob]
     store_jobs: dict[int, TransferJob]
     jobs_to_flush: set[int] | None = None
+    # aris Baton-style layer-wise: pending load jobs of the requests computed in this
+    # step; their forward waits per layer for these loads
+    compute_jobs: set[int] | None = None
 
 
 @dataclass

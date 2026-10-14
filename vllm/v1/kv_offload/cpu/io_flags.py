@@ -15,6 +15,8 @@ import threading
 import time
 
 _FILE = os.environ.get("VLLM_KV_LOAD_PACE_FILE") or None
+# Baton-style layer-wise offload: requests are promoted when layer 0 of their load arrived
+LW_ASYNC = os.environ.get("VLLM_KV_OFFLOAD_LAYERWISE", "0") == "2"
 _st = {"t": 0.0, "mtime": -1.0, "flags": ""}
 LOCK = threading.Lock()
 EARLY_DONE: set[str] = set()      # request ids whose loads finished (seen by the monitor thread)
