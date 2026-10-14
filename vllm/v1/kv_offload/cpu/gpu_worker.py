@@ -1128,10 +1128,10 @@ class SingleDirectionOffloadingHandler:
             if self._xfer_last_call is not None and now - self._xfer_last_call > 0.1:
                 self._xfer_log.write(
                     '{"ev":"gap","dir":"%s","t0":%.4f,"t1":%.4f,"inflight":%d,'
-                    '"inflight_bytes":%d}\n'
+                    '"inflight_bytes":%d,"pid":%d}\n'
                     % (self._xfer_dir, self._xfer_last_call, now,
                        len(self._transfers),
-                       sum(t.num_bytes for t in self._transfers))
+                       sum(t.num_bytes for t in self._transfers), os.getpid())
                 )
             self._xfer_last_call = now
         results: list[TransferResult] = []
@@ -1166,10 +1166,11 @@ class SingleDirectionOffloadingHandler:
                 self._xfer_log.write(
                     '{"ev":"xfer","dir":"%s","job":%d,"bytes":%d,"ops":%d,'
                     '"t_submit":%.4f,"t_detect":%.4f,"gpu_s":%.5f,'
-                    '"t_start_seen":%.4f,"t_end_seen":%.4f}\n'
+                    '"t_start_seen":%.4f,"t_end_seen":%.4f,"pid":%d}\n'
                     % (self._xfer_dir, transfer.job_id, transfer.num_bytes,
                        transfer.num_ops, transfer.t_submit, time.time(),
-                       transfer_time, transfer.t_start_seen, transfer.t_end_seen)
+                       transfer_time, transfer.t_start_seen, transfer.t_end_seen,
+                       os.getpid())
                 )
             self._stream_pool.append(transfer.stream)
             self._event_pool.append(transfer.end_event)
