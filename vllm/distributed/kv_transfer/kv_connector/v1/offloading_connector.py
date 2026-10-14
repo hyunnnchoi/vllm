@@ -127,7 +127,8 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
             pump()
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        pass
+        if self.connector_worker is not None:
+            self.connector_worker.wait_for_layer_load(layer_name)
 
     def save_kv_layer(
         self,

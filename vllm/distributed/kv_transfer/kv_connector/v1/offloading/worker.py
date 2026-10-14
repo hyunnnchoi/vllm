@@ -68,6 +68,9 @@ class OffloadingConnectorWorker:
 
         # job_id -> req_id for in-flight loads.
         self._load_jobs: dict[int, ReqId] = {}
+        # aris layer-wise loads: settled through completed_jobs only (the request is
+        # already running, so it must not be reported in finished_recving)
+        self._layerwise_jobs: set[int] = set()
         self._unsubmitted_store_jobs: list[
             tuple[int, GPULoadStoreSpec, LoadStoreSpec]
         ] = []
@@ -210,11 +213,17 @@ class OffloadingConnectorWorker:
                     )
 
         group_data_refs: list[list[CanonicalKVCacheRef]] = []
+        from vllm.v1.kv_offload.cpu import gpu_worker as _cpu_gw
+
+        _cpu_gw.REF_LAYER_NAMES.clear()
         for kv_cache_group in selected_groups:
             group_refs: list[CanonicalKVCacheRef] = []
+            ref_names: list[str] = []
             for layer_name in kv_cache_group.layer_names:
                 group_refs += block_data_refs[layer_name]
+                ref_names += [layer_name] * len(block_data_refs[layer_name])
             group_data_refs.append(group_refs)
+            _cpu_gw.REF_LAYER_NAMES.append(ref_names)
 
         canonical_kv_caches = CanonicalKVCaches(
             tensors=block_tensors,
@@ -252,12 +261,35 @@ class OffloadingConnectorWorker:
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
         assert self.worker is not None
+        from vllm.v1.kv_offload.cpu import gpu_worker as _cpu_gw
+
+        if _cpu_gw.LAYER_EVENTS:
+            # a previous step's layer events were not all consumed by the attention
+            # layers: its forward did not wait per layer (should not happen)
+            logger.warning(
+                "layer-wise: %d layers' load events were not waited on",
+                len(_cpu_gw.LAYER_EVENTS),
+            )
+            _cpu_gw.LAYER_EVENTS.clear()
         for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
             success = self.worker.submit_store(job_id, src_spec, dst_spec)
             assert success
         self._unsubmitted_store_jobs.clear()
 
         for job_id, entry in metadata.load_jobs.items():
+            if _cpu_gw.LAYERWISE:
+                self._layerwise_jobs.add(job_id)
+                if _XFER_LOG is not None:
+                    _XFER_LOG.write(
+                        '{"ev":"job","job":%d,"req":"%s","t":%.4f,"lw":1}\n'
+                        % (job_id, entry.req_id, time.time())
+                    )
+                assert isinstance(entry.dst_spec, GPULoadStoreSpec)
+                success = self.worker.submit_load_layerwise(
+                    job_id, entry.src_spec, entry.dst_spec
+                )
+                assert success
+                continue
             self._load_jobs[job_id] = entry.req_id
             if "e" in _io_flags.flags():
                 _io_flags.job_submitted(job_id, entry.req_id)
@@ -300,7 +332,7 @@ class OffloadingConnectorWorker:
             # we currently do not support job failures
             job_id = transfer_result.job_id
             assert transfer_result.success
-            is_load = job_id in self._load_jobs
+            is_load = job_id in self._load_jobs or job_id in self._layerwise_jobs
             if (
                 transfer_result.transfer_time is not None
                 and transfer_result.transfer_size is not None
@@ -315,11 +347,23 @@ class OffloadingConnectorWorker:
                 )
 
             self._connector_worker_meta.mark_completed(job_id)
+            self._layerwise_jobs.discard(job_id)
             req_id = self._load_jobs.pop(job_id, None)
             if req_id is not None:
                 finished_recving.add(req_id)
 
         return set(), finished_recving
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        """aris layer-wise: make the current (compute) stream wait for this layer's
+        in-step loads."""
+        from vllm.v1.kv_offload.cpu import gpu_worker as _cpu_gw
+
+        events = _cpu_gw.LAYER_EVENTS.pop(layer_name, None)
+        if events:
+            stream = torch.cuda.current_stream()
+            for ev in events:
+                stream.wait_event(ev)
 
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
         """Return completed transfer job IDs since the last call."""

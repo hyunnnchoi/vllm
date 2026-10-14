@@ -65,6 +65,16 @@ def _select_swap_blocks_fn(
     return functools.partial(swap_blocks_batch, bytes_per_chunk=chunk)
 
 
+# aris layer-wise offload (VLLM_KV_OFFLOAD_LAYERWISE=1): a CPU->GPU load is issued inside the step that schedules the
+# request, one copy batch per KV-cache layer, with an event per layer; the attention layer waits on its event
+# (OffloadingConnector.wait_for_layer_load), so transfer of layer l+1 overlaps the compute of layer l.
+LAYERWISE = os.environ.get("VLLM_KV_OFFLOAD_LAYERWISE", "0") == "1"
+# layer name of every CanonicalKVCacheRef, per KV-cache group (set by the offloading worker at registration)
+REF_LAYER_NAMES: list[list[str]] = []
+# layer name -> events of this step's layer-wise loads (consumed by wait_for_layer_load)
+LAYER_EVENTS: dict[str, list] = {}
+
+
 @dataclass
 class Transfer:
     job_id: int
@@ -313,6 +323,7 @@ class SingleDirectionOffloadingHandler:
         )
         self.gpu_to_cpu: bool = gpu_to_cpu
         self.layer_refs_per_group = layer_refs_per_group
+        self._ref_ends: list[tuple[int, int, int]] | None = None
         self._swap_blocks_batch = _select_swap_blocks_fn(
             layer_refs_per_group, gpu_to_cpu
         )
@@ -444,7 +455,7 @@ class SingleDirectionOffloadingHandler:
 
         Returns (op_idx past the filled descriptors, bytes added)."""
         num_bytes = 0
-        for data_ref in self.layer_refs_per_group[g_idx]:
+        for r_idx, data_ref in enumerate(self.layer_refs_per_group[g_idx]):
             t_idx = data_ref.tensor_idx
             end_idx = op_idx + group_size
 
@@ -466,6 +477,8 @@ class SingleDirectionOffloadingHandler:
             all_sizes[op_idx:end_idx] = data_ref.page_size_bytes
             num_bytes += group_size * data_ref.page_size_bytes
             op_idx = end_idx
+            if self._ref_ends is not None:
+                self._ref_ends.append((g_idx, r_idx, op_idx))
         return op_idx, num_bytes
 
     def _fill_canonical_ops(
@@ -496,10 +509,12 @@ class SingleDirectionOffloadingHandler:
             self._scratch_bases_dst = np.empty(group_size, dtype=np.uint64)
 
         num_bytes = 0
-        for plan, data_ref in zip(
-            self._canonical_copy_plans[g_idx], self.layer_refs_per_group[g_idx]
+        for r_idx, (plan, data_ref) in enumerate(
+            zip(self._canonical_copy_plans[g_idx], self.layer_refs_per_group[g_idx])
         ):
             if plan.num_frags == 0:
+                if self._ref_ends is not None:
+                    self._ref_ends.append((g_idx, r_idx, op_idx))
                 continue
             t_idx = data_ref.tensor_idx
 
@@ -559,6 +574,8 @@ class SingleDirectionOffloadingHandler:
             )
             num_bytes += num_active_blocks * plan.total_bytes
             op_idx = end_idx
+            if self._ref_ends is not None:
+                self._ref_ends.append((g_idx, r_idx, op_idx))
         return op_idx, num_bytes
 
     def _filter_writer_blocks(
@@ -583,9 +600,15 @@ class SingleDirectionOffloadingHandler:
         return block_bases_src[writer_mask], block_bases_dst[writer_mask]
 
     def transfer_async(
-        self, job_id: int, src_spec: LoadStoreSpec, dst_spec: LoadStoreSpec
+        self,
+        job_id: int,
+        src_spec: LoadStoreSpec,
+        dst_spec: LoadStoreSpec,
+        layerwise: bool = False,
     ) -> bool:
         assert isinstance(src_spec, BlockIDsLoadStoreSpec)
+        layerwise = layerwise and not self.gpu_to_cpu
+        self._ref_ends = [] if layerwise else None
         assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
 
         src_blocks = src_spec.block_ids
@@ -729,15 +752,30 @@ class SingleDirectionOffloadingHandler:
         # writing; we must keep STREAM ordering so source reads are gated
         # by the transfer stream's wait_stream(compute) barrier.
         is_src_access_order_any = not self.gpu_to_cpu
-        paced = mode in ("pace", "pace_in", "adapt", "queue") and op_idx > 0
+        paced = mode in ("pace", "pace_in", "adapt", "queue") and op_idx > 0 and not layerwise
         fn = self._swap_blocks_batch
-        if mode == "triton" and self._triton_fn is not None:
+        if mode == "triton" and self._triton_fn is not None and not layerwise:
             _sbt.NUM_SMS = val
             fn = self._triton_fn
         t_call = time.time()   # before the copy call (a large batch call blocks)
         with current_platform.stream(stream):
             start_event.record(stream)
-            if op_idx > 0 and not paced:
+            if layerwise:
+                # one copy batch per ref (= per KV-cache layer), an event after each
+                prev = 0
+                for g_idx, r_idx, end in self._ref_ends:
+                    if end > prev:
+                        fn(
+                            src[prev:end],
+                            dst[prev:end],
+                            sizes[prev:end],
+                            is_src_access_order_any=is_src_access_order_any,
+                        )
+                    ev = torch.Event()
+                    ev.record(stream)
+                    LAYER_EVENTS.setdefault(REF_LAYER_NAMES[g_idx][r_idx], []).append(ev)
+                    prev = end
+            elif op_idx > 0 and not paced:
                 fn(
                     src,
                     dst,
@@ -746,6 +784,7 @@ class SingleDirectionOffloadingHandler:
                 )
             if not paced:
                 end_event.record(stream)
+        self._ref_ends = None
 
         self._transfer_events[job_id] = end_event
         self._lock.acquire()
@@ -1167,6 +1206,14 @@ class CPUOffloadingWorker(OffloadingWorker):
     ) -> bool:
         """Async CPU -> GPU."""
         return self._load_handler.transfer_async(job_id, src_spec, dst_spec)
+
+    def submit_load_layerwise(
+        self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec
+    ) -> bool:
+        """In-step CPU -> GPU, one batch and one event per layer (LAYER_EVENTS)."""
+        return self._load_handler.transfer_async(
+            job_id, src_spec, dst_spec, layerwise=True
+        )
 
     def get_finished(self) -> list[TransferResult]:
         return self._store_handler.get_finished() + self._load_handler.get_finished()

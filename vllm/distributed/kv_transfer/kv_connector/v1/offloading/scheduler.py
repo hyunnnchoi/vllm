@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -60,6 +61,9 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
+
+# aris layer-wise offload: CPU-tier hits are loaded inside the scheduling step (sync)
+_LAYERWISE = os.environ.get("VLLM_KV_OFFLOAD_LAYERWISE", "0") == "1"
 
 KV_LOAD_TIERS_KEY = "kv_load_tiers"
 MATCHER_MEDIUM_KEY = "medium"
@@ -1070,10 +1074,21 @@ class OffloadingConnectorScheduler:
                     req_status.deferred_lookup_start_time = lookup_start
             else:
                 self._maybe_observe_lookup_async_delay(req_status)
+        if _LAYERWISE and num_hit_tokens:
+            # layer-wise loads run inside the step that schedules the request; keep at
+            # least 2 tokens to compute so that step is never a uniform-decode batch
+            # (a FULL CUDA graph would skip the per-layer waits)
+            chunk = self.config.kv_group_configs[0].tokens_per_chunk
+            while num_hit_tokens > 0 and (
+                request.num_tokens - num_computed_tokens - num_hit_tokens < 2
+            ):
+                num_hit_tokens = max(0, num_hit_tokens - chunk)
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
 
         self._touch(req_status)
 
+        if _LAYERWISE:
+            return num_hit_tokens, False
         return num_hit_tokens, bool(num_hit_tokens)
 
     def update_state_after_alloc(
