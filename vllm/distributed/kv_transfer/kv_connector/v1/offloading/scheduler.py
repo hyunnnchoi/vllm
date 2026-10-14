@@ -601,6 +601,9 @@ class OffloadingConnectorScheduler:
         # aris/layout-ctrlpath io_flags 'e': load jobs settled early from the
         # worker's monitor thread; their regular completion is skipped
         self._early_completed_jobs: set[int] = set()
+        # aris layer-wise: requests whose in-step loads were issued by the previous
+        # scheduling step; settled at the next build_connector_meta (see there)
+        self._lw_settle_next: list[str] = []
 
         # block_id -> pending store job_ids. Used to track jobs that needs
         # flushing in case a block is re-allocated by the KV cache manager.
@@ -1763,6 +1766,22 @@ class OffloadingConnectorScheduler:
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
+        # aris layer-wise: a layer-wise load runs inside the forward of the step that
+        # scheduled it, and that forward waits for every layer. Any store or reuse of the
+        # loaded CPU blocks created from now on is submitted after that forward on the
+        # GPU, so the load can be settled here, before the worker reports it (with async
+        # scheduling the report arrives a step later and store jobs for the request's new
+        # blocks would otherwise see a pending load).
+        for req_id in self._lw_settle_next:
+            self.early_complete_load(req_id)
+            req_status = self._req_status.get(req_id)
+            if (
+                req_status is not None
+                and req_status.finished_signaled
+                and not req_status.transfer_jobs
+            ):
+                del self._req_status[req_id]
+        self._lw_settle_next = []
         self._update_req_states(scheduler_output)
         schedule_end_context = ScheduleEndContext(
             new_req_ids=[req.req_id for req in scheduler_output.scheduled_new_reqs],
@@ -1811,6 +1830,10 @@ class OffloadingConnectorScheduler:
             self.manager.on_request_finished(req_status.req_context)
             if not req_status.transfer_jobs:
                 del self._req_status[req_id]
+        if _LAYERWISE:
+            self._lw_settle_next = [
+                job.req_id for job in self._current_batch_load_jobs.values()
+            ]
         self._current_batch_load_jobs = {}
         self._current_batch_jobs_to_flush = set()
         self._current_batch_allocated_block_ids = set()
