@@ -1720,8 +1720,11 @@ class OffloadingConnectorScheduler:
             dst_spec = store_output.store_spec
 
             job_id = self._generate_job_id()
-            # a store can only be issued when no load is pending.
-            if req_status.transfer_jobs:
+            # a store can only be issued when no load is pending. aris layer-wise: an
+            # in-step load is complete before any store built now runs on the GPU
+            # (stores are submitted at the next step, after the load step's forward,
+            # which waits for every layer), so a pending layer-wise load is allowed.
+            if req_status.transfer_jobs and not _LAYERWISE:
                 any_jid = next(iter(req_status.transfer_jobs))
                 assert self._jobs[any_jid].is_store
             req_status.transfer_jobs.add(job_id)
@@ -1795,8 +1798,10 @@ class OffloadingConnectorScheduler:
             if req_status is None or not req_status.transfer_jobs:
                 continue
             any_jid = next(iter(req_status.transfer_jobs))
-            assert self._jobs[any_jid].is_store
-            self._current_batch_jobs_to_flush.update(req_status.transfer_jobs)
+            assert _LAYERWISE or self._jobs[any_jid].is_store
+            self._current_batch_jobs_to_flush.update(
+                j for j in req_status.transfer_jobs if self._jobs[j].is_store
+            )
 
         # Flush jobs that contain re-allocated blocks.
         if (
