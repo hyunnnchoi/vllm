@@ -427,6 +427,11 @@ class Worker(WorkerBase):
             self.device = torch.device(f"cuda:{visible_device_index}")
             torch.accelerator.set_device_index(self.device)
 
+            # aris/layout-ctrlpath: engine-wide SM partition (no-op unless VLLM_GC_SPLIT)
+            from vllm.v1.worker import gc_split
+
+            gc_split.install()
+
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
             # Initialize the distributed environment BEFORE taking
