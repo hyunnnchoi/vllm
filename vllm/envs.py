@@ -303,6 +303,8 @@ if TYPE_CHECKING:
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS: int = 0
+    VLLM_CTRL_UVA: bool = False
+    VLLM_KV_LOAD_SUBMIT_LIMIT: str = ""
     VLLM_WSL2_ENABLE_PIN_MEMORY: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
     VLLM_LORA_DISABLE_PDL: bool = False
@@ -2063,6 +2065,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS": lambda: int(
         os.getenv("VLLM_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS", "0")
     ),
+    # Run the model runner's small pinned host<->GPU copies (step inputs,
+    # sampled tokens) as an SM kernel that reads/writes the pinned memory
+    # directly, so a CPU-tier KV load on the copy engine cannot delay them.
+    "VLLM_CTRL_UVA": lambda: bool(int(os.getenv("VLLM_CTRL_UVA", "0"))),
+    # "<cap>:<chunk>": submit CPU-tier KV loads in calls of <chunk> copy
+    # descriptors and keep at most <cap> descriptors submitted but unfinished,
+    # so the batch-memcpy call never waits for driver queue space. Empty = off.
+    "VLLM_KV_LOAD_SUBMIT_LIMIT": lambda: os.getenv("VLLM_KV_LOAD_SUBMIT_LIMIT", ""),
     # On WSL2 with a compatible kernel (>= 4.19.121), pinned memory is
     # supported but disabled by default due to a small performance regression.
     # Set to 1 when pinned memory or UVA is required (e.g. CPU offloading
