@@ -495,6 +495,9 @@ class Worker(WorkerBase):
             )
 
             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
+        from vllm.v1.worker import aris_nvtx
+
+        aris_nvtx.install(self.model_runner)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.

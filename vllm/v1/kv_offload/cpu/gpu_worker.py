@@ -31,6 +31,7 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu import io_flags as _io_flags
 from vllm.v1.kv_offload.cpu import swap_blocks_triton as _sbt
+from vllm.v1.worker import aris_nvtx as _nvtx
 from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
     THRESHOLD_BYTES,
     swap_blocks_batch,
@@ -654,6 +655,9 @@ class SingleDirectionOffloadingHandler:
 
         num_src_blocks = len(src_blocks)
         num_dst_blocks = len(dst_blocks)
+        xdir = "d2h" if self.gpu_to_cpu else "h2d"
+        if _nvtx.ON:
+            torch.cuda.nvtx.range_push(f"kv_prepare {xdir} job={job_id} blocks={num_dst_blocks}")
 
         # There are 2 types of transfers:
         # 1. GPU -> CPU
@@ -751,6 +755,8 @@ class SingleDirectionOffloadingHandler:
         src = src[:op_idx]
         dst = dst[:op_idx]
         sizes = sizes[:op_idx]
+        if _nvtx.ON:
+            torch.cuda.nvtx.range_pop()
 
         stream = (
             self._stream_pool.pop() if self._stream_pool else current_platform.Stream()
@@ -830,12 +836,17 @@ class SingleDirectionOffloadingHandler:
                     LAYER_EVENTS.setdefault(REF_LAYER_NAMES[g_idx][r_idx], []).append(ev)
                     prev = end
             elif op_idx > 0 and not paced:
+                if _nvtx.ON:
+                    torch.cuda.nvtx.range_push(
+                        f"kv_submit {xdir} job={job_id} ops={op_idx} bytes={num_transfer_bytes} mode={mode}")
                 fn(
                     src,
                     dst,
                     sizes,
                     is_src_access_order_any=is_src_access_order_any,
                 )
+                if _nvtx.ON:
+                    torch.cuda.nvtx.range_pop()
             if not paced and not (lw_async and layer_groups):
                 end_event.record(stream)
         self._ref_ends = None
@@ -1107,12 +1118,16 @@ class SingleDirectionOffloadingHandler:
                         prev = t
                     if prev is not None:
                         pending.stream.wait_event(prev.end_event)
+                if _nvtx.ON:
+                    torch.cuda.nvtx.range_push(f"kv_submit_chunk job={pending.job_id} ops={start}:{end} queue")
                 self._swap_blocks_batch(
                     pending.batch_src[start:end],
                     pending.batch_dst[start:end],
                     pending.batch_sizes[start:end],
                     is_src_access_order_any=pending.is_src_access_order_any,
                 )
+                if _nvtx.ON:
+                    torch.cuda.nvtx.range_pop()
                 pending.next_op = end
                 if end >= pending.num_ops:
                     pending.end_event.record(pending.stream)
