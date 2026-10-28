@@ -62,6 +62,8 @@ from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
 
+_STORE_MIN_TOKENS = int(os.environ.get("VLLM_KV_OFFLOAD_STORE_MIN_TOKENS", "0") or 0)
+
 # aris layer-wise offload: CPU-tier hits are loaded inside the scheduling step (sync)
 _LAYERWISE = os.environ.get("VLLM_KV_OFFLOAD_LAYERWISE", "0") == "1"
 # aris Baton-style layer-wise (async loads, promotion at layer 0, per-layer waits)
@@ -1507,6 +1509,10 @@ class OffloadingConnectorScheduler:
             if req_status is None:
                 continue
             req = req_status.req
+            # aris/layout-ctrlpath experiment 109: keep short prompts out of the
+            # CPU tier so a 141K-token prefix is not evicted by co-running streams
+            if req.num_prompt_tokens < _STORE_MIN_TOKENS:
+                continue
 
             if req.status is RequestStatus.FINISHED_ABORTED:
                 num_tokens_after_batch = req.num_computed_tokens
