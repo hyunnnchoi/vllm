@@ -3,6 +3,8 @@
 """Low-level CUDA/HIP memory helpers: pinning and batch DMA transfers."""
 
 import ctypes
+import time
+from collections import deque
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -68,6 +70,35 @@ _max_batch_descriptors: int | None = None
 # ROCm hipMemcpyBatchAsync faults for count > 8192 (MI350X/gfx950), so we chunk
 # at that ceiling. Override via VLLM_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS.
 _ROCM_DEFAULT_MAX_BATCH_DESCRIPTORS = 8192
+
+# Submit-depth limit for loads (VLLM_KV_LOAD_SUBMIT_LIMIT="<cap>:<chunk>"): a
+# load is submitted in calls of <chunk> descriptors with at most <cap>
+# descriptors submitted but unfinished, so cuMemcpyBatchAsync never waits for
+# driver queue space. The copy thread polls the oldest chunk while the limit
+# is reached. Resolved lazily on first use; (0, 0) = off.
+_submit_limit: tuple[int, int] | None = None
+# stream handle -> deque of (event, descriptors) submitted on it
+_inflight: dict[int, deque] = {}
+
+
+def _resolve_submit_limit() -> tuple[int, int]:
+    global _submit_limit
+    if _submit_limit is None:
+        raw = envs.VLLM_KV_LOAD_SUBMIT_LIMIT.strip()
+        _submit_limit = (0, 0)
+        if raw:
+            try:
+                cap, chunk = (int(v) for v in raw.split(":"))
+            except ValueError:
+                cap = chunk = 0
+            if not 0 < chunk <= cap:
+                raise ValueError(
+                    f"VLLM_KV_LOAD_SUBMIT_LIMIT={raw!r}: expected <cap>:<chunk> "
+                    "(copy descriptors) with 0 < chunk <= cap, e.g. 16384:4096"
+                )
+            _submit_limit = (cap, chunk)
+            logger.info("KV load submit limit (cap, chunk) = %s", _submit_limit)
+    return _submit_limit
 
 
 def _resolve_max_batch_descriptors() -> int:
@@ -228,8 +259,12 @@ def copy_blocks(
     src_block_ids: list[int],
     dst_block_ids: list[int],
     params: BatchMemcpyParams,
+    limit: bool = False,
 ) -> None:
-    """Copy blocks via cuMemcpyBatchAsync / hipMemcpyBatchAsync."""
+    """Copy blocks via cuMemcpyBatchAsync / hipMemcpyBatchAsync.
+
+    limit: apply the load submit-depth limit (VLLM_KV_LOAD_SUBMIT_LIMIT), if
+    set. Blocks the calling (copy) thread while the limit is reached."""
     n = len(src_block_ids)
     if n == 0:
         return
@@ -253,8 +288,21 @@ def copy_blocks(
     # CUDA is uncapped (max_desc == 0) and issues a single call.
     max_desc = _resolve_max_batch_descriptors()
     step = total if max_desc <= 0 else max_desc
+    cap, chunk = _resolve_submit_limit() if limit else (0, 0)
+    if cap > 0:
+        step = min(step, chunk)
+        q = _inflight.setdefault(params.stream_handle, deque())
+        stream = torch.cuda.ExternalStream(params.stream_handle)
     for off in range(0, total, step):
         cnt = min(step, total - off)
+        if cap > 0:
+            while q and q[0][0].query():
+                q.popleft()
+            while q and sum(c for _, c in q) + cnt > cap:
+                if q[0][0].query():
+                    q.popleft()
+                else:
+                    time.sleep(0.0005)
         err = fn(
             dst_all[off : off + cnt].ctypes.data,
             src_all[off : off + cnt].ctypes.data,
@@ -270,3 +318,7 @@ def copy_blocks(
             raise RuntimeError(
                 f"batch memcpy failed: err={err} failIdx={params.fail_idx.value}"
             )
+        if cap > 0:
+            ev = torch.cuda.Event()
+            ev.record(stream)
+            q.append((ev, cnt))

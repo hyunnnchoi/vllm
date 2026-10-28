@@ -124,7 +124,7 @@ class DmaCopyBackend:
             stream = store_stream if is_store else load_stream
             if wait_event is not None:
                 stream.wait_event(wait_event)
-            copy_blocks(src_blocks, dst_blocks, params)
+            copy_blocks(src_blocks, dst_blocks, params, limit=not is_store)
             event = torch.Event()
             event.record(stream)
             events_list.append((event_idx, event))
