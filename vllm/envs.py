@@ -2291,6 +2291,12 @@ def compile_factors() -> dict[str, object]:
         "VLLM_HOST_IP",
         "VLLM_ELASTIC_EP_SCALE_UP_LAUNCH",
         "VLLM_FORCE_AOT_LOAD",
+        # Host<->GPU copy-path settings: they act outside the compiled graphs
+        # (step-input copies, KV load submission), so they must not select a
+        # separately compiled and autotuned artifact.
+        "VLLM_CTRL_UVA",
+        "VLLM_KV_LOAD_SUBMIT_LIMIT",
+        "VLLM_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS",
         "S3_ACCESS_KEY_ID",
         "S3_SECRET_ACCESS_KEY",
         "S3_ENDPOINT_URL",
