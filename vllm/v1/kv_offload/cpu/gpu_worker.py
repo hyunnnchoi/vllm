@@ -122,6 +122,7 @@ class Transfer:
     submitted: bool = True
     is_src_access_order_any: bool = False
     t_submit: float = 0.0
+    t_ret: float = 0.0
     # wall-clock times when the monitor thread first saw start/end complete
     t_start_seen: float = 0.0
     t_end_seen: float = 0.0
@@ -429,6 +430,20 @@ class SingleDirectionOffloadingHandler:
         # inter-token gaps with KV loads.
         xfer_log = os.environ.get("VLLM_KV_XFER_LOG")
         self._xfer_log = open(xfer_log, "a", buffering=1) if xfer_log else None
+        # VLLM_KV_GPU_LOG (optional, no extra thread): one JSON line per finished
+        # transfer with the wall-clock time of the submit call and its return,
+        # and the GPU start/end events on the wall clock (via a reference event).
+        gpu_log = os.environ.get("VLLM_KV_GPU_LOG")
+        self._gpu_log = open(gpu_log, "a", buffering=1) if gpu_log else None
+        self._gpu_ref: tuple[torch.Event, float] | None = None
+        self._gpu_ref_next: tuple[torch.Event, float] | None = None
+        if self._gpu_log is not None:
+            ref = torch.Event(enable_timing=True)
+            ref.record()
+            ref.synchronize()
+            self._gpu_ref = (ref, time.time())
+            # re-anchored every 20 s on an idle stream while no transfer is in flight (timer drift)
+            self._gpu_ref_stream = torch.cuda.Stream()
         self._xfer_dir = "store" if gpu_to_cpu else "load"
         self._xfer_last_call: float | None = None
         # queue-mode flags ("ctrlq:<cap>:<chunk>:<flags>"): 't' = a pump thread
@@ -849,6 +864,7 @@ class SingleDirectionOffloadingHandler:
                     torch.cuda.nvtx.range_pop()
             if not paced and not (lw_async and layer_groups):
                 end_event.record(stream)
+        t_ret = time.time()
         self._ref_ends = None
 
         self._transfer_events[job_id] = end_event
@@ -868,6 +884,7 @@ class SingleDirectionOffloadingHandler:
                 submitted=not paced and not (lw_async and layer_groups),
                 is_src_access_order_any=is_src_access_order_any,
                 t_submit=t_call,
+                t_ret=t_ret,
                 layer_groups=layer_groups if lw_async and layer_groups else None,
                 layer_events={} if lw_async and layer_groups else None,
             )
@@ -1119,7 +1136,8 @@ class SingleDirectionOffloadingHandler:
                     if prev is not None:
                         pending.stream.wait_event(prev.end_event)
                 if _nvtx.ON:
-                    torch.cuda.nvtx.range_push(f"kv_submit_chunk job={pending.job_id} ops={start}:{end} queue")
+                    torch.cuda.nvtx.range_push(
+                        f"kv_submit_chunk job={pending.job_id} ops={start}:{end} inflight={in_flight} queue")
                 self._swap_blocks_batch(
                     pending.batch_src[start:end],
                     pending.batch_dst[start:end],
@@ -1159,6 +1177,15 @@ class SingleDirectionOffloadingHandler:
                 )
             self._xfer_last_call = now
         results: list[TransferResult] = []
+        if self._gpu_log is not None:
+            nxt = self._gpu_ref_next
+            if nxt is not None and nxt[0].query() and not self._transfers:
+                self._gpu_ref, self._gpu_ref_next = nxt, None
+            elif nxt is None and not self._transfers and time.time() - self._gpu_ref[1] > 20.0:
+                ev = torch.Event(enable_timing=True)
+                t = time.time()
+                ev.record(self._gpu_ref_stream)
+                self._gpu_ref_next = (ev, t)
         if not self.gpu_to_cpu and self._mode()[0] == "queue" and self._q_srpt:
             done = [t for t in self._transfers if t.submitted and t.end_event.query()]
             if done:
@@ -1186,6 +1213,17 @@ class SingleDirectionOffloadingHandler:
             )
 
             results.append(result)
+            if self._gpu_log is not None:
+                ref, t_ref = self._gpu_ref
+                self._gpu_log.write(
+                    '{"dir":"%s","job":%d,"bytes":%d,"ops":%d,"mode":"%s","t_submit":%.6f,'
+                    '"t_ret":%.6f,"g_start":%.6f,"g_end":%.6f,"t_detect":%.6f,"pid":%d}\n'
+                    % (self._xfer_dir, transfer.job_id, transfer.num_bytes,
+                       transfer.num_ops, self._mode()[0], transfer.t_submit,
+                       transfer.t_ret, t_ref + ref.elapsed_time(transfer.start_event) / 1e3,
+                       t_ref + ref.elapsed_time(transfer.end_event) / 1e3, time.time(),
+                       os.getpid())
+                )
             if self._xfer_log is not None:
                 self._xfer_log.write(
                     '{"ev":"xfer","dir":"%s","job":%d,"bytes":%d,"ops":%d,'
