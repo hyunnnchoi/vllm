@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, triton
@@ -61,6 +62,23 @@ def _select_swap_blocks_fn(
     return functools.partial(swap_blocks_batch, bytes_per_chunk=chunk)
 
 
+def _load_submit_limit() -> tuple[int, int]:
+    """VLLM_KV_LOAD_SUBMIT_LIMIT "<cap>:<chunk>" -> (cap, chunk); (0, 0) = off."""
+    raw = envs.VLLM_KV_LOAD_SUBMIT_LIMIT.strip()
+    if not raw:
+        return 0, 0
+    try:
+        cap, chunk = (int(v) for v in raw.split(":"))
+    except ValueError:
+        cap = chunk = 0
+    if not 0 < chunk <= cap:
+        raise ValueError(
+            f"VLLM_KV_LOAD_SUBMIT_LIMIT={raw!r}: expected <cap>:<chunk> "
+            "(copy descriptors) with 0 < chunk <= cap, e.g. 16384:4096"
+        )
+    return cap, chunk
+
+
 @dataclass
 class Transfer:
     job_id: int
@@ -71,6 +89,13 @@ class Transfer:
     batch_src: torch.Tensor
     batch_dst: torch.Tensor
     batch_sizes: torch.Tensor
+    # Loads under the submit limit: descriptors not yet submitted are
+    # batch_*[next_op:num_ops]; end_event is recorded with the last chunk,
+    # so `submitted` guards queries on it.
+    num_ops: int = 0
+    next_op: int = 0
+    submitted: bool = True
+    is_src_access_order_any: bool = False
 
 
 def compute_sub_block_ptrs(
@@ -324,6 +349,19 @@ class SingleDirectionOffloadingHandler:
         num_scratch_blocks = gpu_tensors[0].shape[0] if canonical_layout else 0
         self._scratch_bases_src = np.empty(num_scratch_blocks, dtype=np.uint64)
         self._scratch_bases_dst = np.empty(num_scratch_blocks, dtype=np.uint64)
+
+        # Submit-depth limit for CPU->GPU loads (VLLM_KV_LOAD_SUBMIT_LIMIT).
+        # One batch-memcpy call with tens of thousands of descriptors does not
+        # return until the driver has queue space, i.e. until most of the load
+        # has drained, which holds the engine thread for the whole load. With
+        # the limit, a load is submitted in calls of `chunk` descriptors and at
+        # most `cap` descriptors stay submitted but unfinished; the rest is
+        # submitted from get_finished(), once per engine step, so the copy
+        # engine always has work and the call returns at once.
+        self._submit_cap, self._submit_chunk = (
+            (0, 0) if gpu_to_cpu else _load_submit_limit()
+        )
+        self._inflight_chunks: deque[tuple[torch.Event, int]] = deque()
 
         # job_id -> event
         self._transfer_events: dict[int, torch.Event] = {}
@@ -653,16 +691,18 @@ class SingleDirectionOffloadingHandler:
         # writing; we must keep STREAM ordering so source reads are gated
         # by the transfer stream's wait_stream(compute) barrier.
         is_src_access_order_any = not self.gpu_to_cpu
+        limited = self._submit_cap > 0 and op_idx > 0
         with current_platform.stream(stream):
             start_event.record(stream)
-            if op_idx > 0:
+            if op_idx > 0 and not limited:
                 self._swap_blocks_batch(
                     src,
                     dst,
                     sizes,
                     is_src_access_order_any=is_src_access_order_any,
                 )
-            end_event.record(stream)
+            if not limited:
+                end_event.record(stream)
 
         self._transfer_events[job_id] = end_event
         self._transfers.append(
@@ -675,15 +715,64 @@ class SingleDirectionOffloadingHandler:
                 batch_src=batch_src,
                 batch_dst=batch_dst,
                 batch_sizes=batch_sizes,
+                num_ops=op_idx,
+                submitted=not limited,
+                is_src_access_order_any=is_src_access_order_any,
             )
         )
+        if limited:
+            self._submit_pending()
 
         # success
         return True
 
+    def _submit_pending(self, force: bool = False) -> None:
+        """Submit the next chunks of loads that are not fully submitted, in
+        order, while at most `cap` descriptors are submitted but unfinished
+        (everything that is left with force, for wait() and shutdown())."""
+        while self._inflight_chunks and self._inflight_chunks[0][0].query():
+            self._inflight_chunks.popleft()
+        in_flight = sum(n for _, n in self._inflight_chunks)
+        prev: Transfer | None = None
+        for t in self._transfers:
+            while not t.submitted:
+                start = t.next_op
+                n = min(self._submit_chunk, t.num_ops - start)
+                if not force and in_flight > 0 and in_flight + n > self._submit_cap:
+                    return
+                end = start + n
+                with current_platform.stream(t.stream):
+                    if start == 0 and prev is not None:
+                        # FIFO with the previous load: its end_event was not
+                        # recorded yet when this transfer was created
+                        t.stream.wait_event(prev.end_event)
+                    self._swap_blocks_batch(
+                        t.batch_src[start:end],
+                        t.batch_dst[start:end],
+                        t.batch_sizes[start:end],
+                        is_src_access_order_any=t.is_src_access_order_any,
+                    )
+                    t.next_op = end
+                    if end >= t.num_ops:
+                        t.end_event.record(t.stream)
+                        t.submitted = True
+                        ev = t.end_event
+                    else:
+                        ev = torch.Event()
+                        ev.record(t.stream)
+                self._inflight_chunks.append((ev, n))
+                in_flight += n
+            prev = t
+
     def get_finished(self) -> list[TransferResult]:
+        if self._submit_cap > 0:
+            self._submit_pending()
         results: list[TransferResult] = []
-        while self._transfers and self._transfers[0].end_event.query():
+        while (
+            self._transfers
+            and self._transfers[0].submitted
+            and self._transfers[0].end_event.query()
+        ):
             transfer = self._transfers.popleft()
             transfer_time = (
                 transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
@@ -706,6 +795,8 @@ class SingleDirectionOffloadingHandler:
         return results
 
     def wait(self, job_ids: set[int]):
+        if any(not t.submitted for t in self._transfers):
+            self._submit_pending(force=True)
         for job_id in job_ids:
             event = self._transfer_events.get(job_id)
             if event is not None:
@@ -713,6 +804,8 @@ class SingleDirectionOffloadingHandler:
 
     def shutdown(self) -> None:
         """Drain this direction and release its transfer-side resources."""
+        if any(not t.submitted for t in self._transfers):
+            self._submit_pending(force=True)
         sync_error: Exception | None = None
         while self._transfers:
             transfer = self._transfers[0]
