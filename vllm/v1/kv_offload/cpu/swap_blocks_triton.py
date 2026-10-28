@@ -72,3 +72,68 @@ def swap_blocks_batch(
         n,
         BYTES_PER_CHUNK=bytes_per_chunk,
     )
+
+
+# aris/layout-ctrlpath experiment 109: the kernel above with J descriptors per
+# program step ([J, WORDS] block) and a free grid size P / warp count W
+# (exp/108_sm-parallelism). "triton:<P>:<W>:<J>" / "tritongc:<P>:<W>:<J>".
+@triton.jit
+def _swap_blocks_kernel_j(
+    src_addrs,
+    dst_addrs,
+    sizes,
+    n_jobs,  # type: ignore[name-defined]
+    J: tl.constexpr,  # type: ignore[name-defined]
+    WORDS: tl.constexpr,  # type: ignore[name-defined]
+    TAG: tl.constexpr,  # type: ignore[name-defined]
+):
+    pid = tl.program_id(0)
+    nprog = tl.num_programs(0)
+    rows = tl.arange(0, J)
+    cols = tl.arange(0, WORDS)
+    base = pid * J
+    while base < n_jobs:
+        jobs = base + rows
+        jm = jobs < n_jobs
+        src = tl.load(src_addrs + jobs, mask=jm, other=0).to(tl.pointer_type(tl.int64))
+        dst = tl.load(dst_addrs + jobs, mask=jm, other=0).to(tl.pointer_type(tl.int64))
+        words = tl.load(sizes + jobs, mask=jm, other=0) // 8
+        maxw = tl.max(words, axis=0)
+        for start in range(0, maxw, WORDS):
+            idx = start + cols
+            m = idx[None, :] < words[:, None]
+            d = tl.load(src[:, None] + idx[None, :], mask=m, other=0)
+            tl.store(dst[:, None] + idx[None, :], d, mask=m)
+        base += nprog * J
+
+
+def swap_blocks_batch_j(
+    src_addrs: torch.Tensor,
+    dst_addrs: torch.Tensor,
+    sizes: torch.Tensor,
+    is_src_access_order_any: bool = False,
+    *,
+    bytes_per_chunk: int,
+    P: int,
+    W: int,
+    J: int,
+    green: bool = False,
+) -> None:
+    n = src_addrs.numel()
+    if n == 0:
+        return
+    s = src_addrs.to("cuda", non_blocking=True)
+    d = dst_addrs.to("cuda", non_blocking=True)
+    z = sizes.to("cuda", non_blocking=True)
+
+    def launch() -> None:
+        _swap_blocks_kernel_j[(min(P, n),)](
+            s, d, z, n, J=J, WORDS=bytes_per_chunk // 8, TAG=int(green), num_warps=W
+        )
+
+    if not green:
+        launch()
+        return
+    from vllm.v1.worker import gc_split
+
+    gc_split.launch_on_part(launch)

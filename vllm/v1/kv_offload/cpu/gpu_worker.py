@@ -803,6 +803,12 @@ class SingleDirectionOffloadingHandler:
         if mode == "triton" and self._triton_fn is not None and not layerwise:
             _sbt.NUM_SMS = val
             fn = self._triton_fn
+        elif mode in ("tritonx", "tritongc") and self._triton_fn is not None and not layerwise:
+            fn = functools.partial(
+                _sbt.swap_blocks_batch_j,
+                bytes_per_chunk=self._triton_fn.keywords["bytes_per_chunk"],
+                P=val[0], W=val[1], J=val[2], green=mode == "tritongc",
+            )
         t_call = time.time()   # before the copy call (a large batch call blocks)
         with current_platform.stream(stream):
             start_event.record(stream)
@@ -989,6 +995,9 @@ class SingleDirectionOffloadingHandler:
                 if (self._q_thread or "e" in flags) and not self.gpu_to_cpu:
                     self._start_bg()
                 return "queue", cap
+            if raw.startswith(("triton:", "tritongc:")):
+                head, *pwj = raw.split(":")
+                return ("tritonx" if head == "triton" else "tritongc"), tuple(int(x) for x in pwj)
             if raw.startswith("triton"):
                 return "triton", int(raw[6:])
             if raw.startswith("in:"):
@@ -1004,7 +1013,7 @@ class SingleDirectionOffloadingHandler:
 
     def _pacing_setting(self) -> int:
         mode, _ = self._mode()
-        return 0 if mode in ("stock", "triton") else 1
+        return 0 if mode in ("stock", "triton", "tritonx", "tritongc") else 1
 
     def pump_at_inputs(self) -> None:
         """Called right before the forward, after the step's input copies."""
