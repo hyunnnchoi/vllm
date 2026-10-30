@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import json
 import os
 import threading
 import time
@@ -507,6 +508,14 @@ class SingleDirectionOffloadingHandler:
         self._evq_inflight: deque = deque()
         self._evq_last_hook = 0.0
         self._ipc = None
+        # "ctrlauto": protected DMA (1a + 1b + 1c) with a per-load switch to the SM copy kernel from the startup
+        # calibration table (VLLM_KV_AUTO_CALIB=1)
+        self._auto = None
+        self._auto_on = False
+        if not gpu_to_cpu and os.environ.get("VLLM_KV_AUTO_CALIB") == "1" and self._triton_fn is not None:
+            from vllm.v1.kv_offload.cpu.auto_select import AutoTable
+            self._auto = AutoTable(max(_pages), self._triton_fn.keywords["bytes_per_chunk"])
+            logger.info("aris auto calibration: %s", json.dumps(self._auto.summary()))
         self._lock = threading.RLock()
         self._bg: threading.Thread | None = None
         self._bg_device = torch.cuda.current_device() if torch.cuda.is_available() else None
@@ -898,6 +907,17 @@ class SingleDirectionOffloadingHandler:
                 bytes_per_chunk=self._triton_fn.keywords["bytes_per_chunk"],
                 P=self._q_route_pwj[0], W=self._q_route_pwj[1], J=self._q_route_pwj[2], green=False,
             )
+        auto_sm = (
+            mode == "queue" and self._auto_on and self._auto is not None and self._triton_fn is not None
+            and not layerwise and op_idx > 0 and self._auto.choose(op_idx) == "sm"
+        )
+        if auto_sm:
+            paced = False
+            fn = functools.partial(
+                _sbt.swap_blocks_batch_j,
+                bytes_per_chunk=self._triton_fn.keywords["bytes_per_chunk"],
+                P=self._auto.shape[0], W=4, J=self._auto.shape[1], green=False,
+            )
         t_call = time.time()   # before the copy call (a large batch call blocks)
         with current_platform.stream(stream):
             start_event.record(stream)
@@ -964,7 +984,8 @@ class SingleDirectionOffloadingHandler:
                 t_ret=t_ret,
                 layer_groups=layer_groups if lw_async and layer_groups else None,
                 layer_events={} if lw_async and layer_groups else None,
-                path="sm" if route_sm else ("ipc" if use_ipc else ""),
+                path="sm" if route_sm else ("ipc" if use_ipc else ("autosm" if auto_sm else (
+                    "autodma" if self._auto_on and mode == "queue" and op_idx > 0 else ""))),
             )
         )
         if lw_async:
@@ -1090,7 +1111,12 @@ class SingleDirectionOffloadingHandler:
             except OSError:
                 pass
         raw = getattr(self, "_pace_raw", str(self._pace_bytes))
+        self._auto_on = raw.startswith("ctrlauto")
         try:
+            if self._auto_on:
+                self._q_cap, self._q_chunk = 16384, 4096
+                self._q_dma, self._q_route, self._q_thread, self._q_srpt = True, False, False, True
+                return "queue", self._q_cap
             if raw.startswith("ctrlq:"):
                 parts = raw[6:].split(":")
                 cap, chunk = int(parts[0]), int(parts[1])
