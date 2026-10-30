@@ -155,6 +155,9 @@ class Transfer:
     first_ready: bool = False
     # path actually used for the copy ("" = the control mode); "sm" for a load routed by the "B" queue flag
     path: str = ""
+    # "evq": chunks submitted from the pre-forward hook (after an input-ready event) / without it
+    evq_hook: int = 0
+    evq_fallback: int = 0
 
 
 def compute_sub_block_ptrs(
@@ -302,6 +305,10 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
             region.total_size_bytes / 1e9,
         )
         region.is_pinned = True
+
+
+# CPU-tier shared region of this worker (for the "ipc" baseline: the loader process maps the same file)
+_IPC_REGION = None
 
 
 def _new_descriptor_buffers(
@@ -495,6 +502,11 @@ class SingleDirectionOffloadingHandler:
         # byte for byte with the CPU source (logged as verify_n / verify_bad).
         self._verify_n = int(os.environ.get("VLLM_KV_VERIFY_SAMPLES", "0"))
         self._verify_last = (0, 0)
+        # "evq:<n>" (explicit-event bounded DMA baseline) and "ipc" (separate loader process)
+        self._evq_n = 4096
+        self._evq_inflight: deque = deque()
+        self._evq_last_hook = 0.0
+        self._ipc = None
         self._lock = threading.RLock()
         self._bg: threading.Thread | None = None
         self._bg_device = torch.cuda.current_device() if torch.cuda.is_available() else None
@@ -851,7 +863,8 @@ class SingleDirectionOffloadingHandler:
         # writing; we must keep STREAM ordering so source reads are gated
         # by the transfer stream's wait_stream(compute) barrier.
         is_src_access_order_any = not self.gpu_to_cpu
-        paced = mode in ("pace", "pace_in", "adapt", "queue") and op_idx > 0 and not layerwise
+        paced = mode in ("pace", "pace_in", "adapt", "queue", "evq") and op_idx > 0 and not layerwise
+        use_ipc = mode == "ipc" and not self.gpu_to_cpu and op_idx > 0 and not layerwise
         layer_groups = None
         if lw_async:
             layer_groups, prev = [], 0
@@ -905,6 +918,15 @@ class SingleDirectionOffloadingHandler:
                     ev.record(stream)
                     LAYER_EVENTS.setdefault(REF_LAYER_NAMES[g_idx][r_idx], []).append(ev)
                     prev = end
+            elif use_ipc:
+                if self._ipc is None:
+                    from vllm.v1.kv_offload.cpu.ipc_loader import IpcLoaderClient
+                    r = _IPC_REGION
+                    assert r is not None and r.fd is not None, "ipc baseline needs the shared CPU region"
+                    self._ipc = IpcLoaderClient(self.dst_tensors, r._base.data_ptr(), r.total_size_bytes, r.fd,
+                                                torch.cuda.current_device())
+                self._event_pool.append(end_event)   # replaced by the interprocess event below
+                end_event = self._ipc.submit(job_id, all_src[:op_idx], all_dst[:op_idx], all_sizes[:op_idx], stream)
             elif op_idx > 0 and not paced:
                 if _nvtx.ON:
                     torch.cuda.nvtx.range_push(
@@ -917,7 +939,7 @@ class SingleDirectionOffloadingHandler:
                 )
                 if _nvtx.ON:
                     torch.cuda.nvtx.range_pop()
-            if not paced and not (lw_async and layer_groups):
+            if not paced and not (lw_async and layer_groups) and not use_ipc:
                 end_event.record(stream)
         t_ret = time.time()
         self._ref_ends = None
@@ -942,7 +964,7 @@ class SingleDirectionOffloadingHandler:
                 t_ret=t_ret,
                 layer_groups=layer_groups if lw_async and layer_groups else None,
                 layer_events={} if lw_async and layer_groups else None,
-                path="sm" if route_sm else "",
+                path="sm" if route_sm else ("ipc" if use_ipc else ""),
             )
         )
         if lw_async:
@@ -1085,6 +1107,11 @@ class SingleDirectionOffloadingHandler:
                 return "queue", cap
             if raw == "dma":
                 return "dma", 0
+            if raw == "ipc":
+                return "ipc", 0
+            if raw.startswith("evq:"):
+                self._evq_n = int(raw[4:])
+                return "evq", self._evq_n
             if raw.startswith(("triton:", "tritongc:")):
                 head, *pwj = raw.split(":")
                 return ("tritonx" if head == "triton" else "tritongc"), tuple(int(x) for x in pwj)
@@ -1107,8 +1134,74 @@ class SingleDirectionOffloadingHandler:
 
     def pump_at_inputs(self) -> None:
         """Called right before the forward, after the step's input copies."""
-        if not self.gpu_to_cpu and self._mode()[0] == "pace_in":
+        if self.gpu_to_cpu:
+            return
+        mode = self._mode()[0]
+        if mode == "pace_in":
             self._pump()
+        elif mode == "evq":
+            self._evq_last_hook = time.time()   # a forward follows: no fallback submission
+            if any(not t.submitted for t in self._transfers):
+                ready = torch.Event()
+                ready.record(torch.cuda.current_stream())
+                with self._lock:
+                    self._pump_evq(ready)
+
+    def _pump_evq(self, ready) -> None:
+        """'evq:<n>' baseline: one chunk of n descriptors per engine step, submitted from
+        the pre-forward hook and ordered on the GPU after that step's input copies (the
+        load stream waits on an input-ready event); at most two chunks in flight (the
+        host runs one step ahead). With no hook call for 50 ms (no forward), a chunk is
+        submitted without the event so that the load still progresses."""
+        now = time.time()
+        if ready is None and now - self._evq_last_hook < 0.05:
+            return
+        if ready is not None:
+            self._evq_last_hook = now
+        while self._evq_inflight and self._evq_inflight[0].query():
+            self._evq_inflight.popleft()
+        if len(self._evq_inflight) >= 2:
+            return
+        pending = next((t for t in self._transfers if not t.submitted), None)
+        if pending is None:
+            return
+        start = pending.next_op
+        end = min(pending.num_ops, start + self._evq_n)
+        with current_platform.stream(pending.stream):
+            if ready is not None:
+                pending.stream.wait_event(ready)
+            if start == 0:
+                prev = None
+                for t in self._transfers:
+                    if t is pending:
+                        break
+                    prev = t
+                if prev is not None:
+                    pending.stream.wait_event(prev.end_event)
+            if _nvtx.ON:
+                torch.cuda.nvtx.range_push(
+                    f"kv_submit_chunk job={pending.job_id} ops={start}:{end} evq hook={int(ready is not None)}")
+            ops.swap_blocks_batch(
+                pending.batch_src[start:end],
+                pending.batch_dst[start:end],
+                pending.batch_sizes[start:end],
+                is_src_access_order_any=pending.is_src_access_order_any,
+            )
+            if _nvtx.ON:
+                torch.cuda.nvtx.range_pop()
+            pending.next_op = end
+            if ready is not None:
+                pending.evq_hook += 1
+            else:
+                pending.evq_fallback += 1
+            if end >= pending.num_ops:
+                pending.end_event.record(pending.stream)
+                pending.submitted = True
+                ev = pending.end_event
+            else:
+                ev = torch.Event()
+                ev.record(pending.stream)
+        self._evq_inflight.append(ev)
 
     def _pump(self, force: bool = False) -> None:
         """Submit the next chunk of the oldest partially submitted load.
@@ -1116,8 +1209,12 @@ class SingleDirectionOffloadingHandler:
         Without force: only if the previous chunk has finished (one chunk in
         flight), and at most the pacing budget in bytes. With force: submit
         everything that is left (used by wait() and shutdown())."""
-        if not force and self._mode()[0] == "queue":
+        mode = self._mode()[0]
+        if not force and mode == "queue":
             self._pump_queue()
+            return
+        if not force and mode == "evq":
+            self._pump_evq(None)
             return
         pending = next(
             (t for t in self._transfers
@@ -1267,9 +1364,18 @@ class SingleDirectionOffloadingHandler:
             LW_JOBS.pop(transfer.job_id, None)
             if self._verify_n and not self.gpu_to_cpu:
                 self._verify_last = _verify_load(transfer, self._verify_n)
-            transfer_time = (
-                transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
-            )  # elapsed_time is in milliseconds
+            ipc_times = None
+            if transfer.path == "ipc":
+                # the loader process times the copy (the interprocess event has no timing)
+                t_wait = time.time()
+                while transfer.job_id not in self._ipc.times and time.time() - t_wait < 0.02:
+                    time.sleep(0.0005)
+                ipc_times = self._ipc.times.pop(transfer.job_id, (float("nan"), float("nan")))
+                transfer_time = ipc_times[1] - ipc_times[0]
+            else:
+                transfer_time = (
+                    transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
+                )  # elapsed_time is in milliseconds
             result = TransferResult(
                 job_id=transfer.job_id,
                 success=True,
@@ -1280,17 +1386,19 @@ class SingleDirectionOffloadingHandler:
             results.append(result)
             if self._gpu_log is not None:
                 ref, t_ref = self._gpu_ref
+                g_start, g_end = ipc_times if ipc_times is not None else (
+                    t_ref + ref.elapsed_time(transfer.start_event) / 1e3,
+                    t_ref + ref.elapsed_time(transfer.end_event) / 1e3)
                 self._gpu_log.write(
                     '{"dir":"%s","job":%d,"bytes":%d,"ops":%d,"mode":"%s","t_submit":%.6f,'
                     '"t_ret":%.6f,"g_start":%.6f,"g_end":%.6f,"t_detect":%.6f,"pid":%d,'
                     '"wait_unsubmitted":%d,"wait_drains":%d,"q_inflight_max":%d,'
-                    '"verify_n":%d,"verify_bad":%d}\n'
+                    '"verify_n":%d,"verify_bad":%d,"evq_hook":%d,"evq_fallback":%d}\n'
                     % (self._xfer_dir, transfer.job_id, transfer.num_bytes,
                        transfer.num_ops, transfer.path or self._mode()[0], transfer.t_submit,
-                       transfer.t_ret, t_ref + ref.elapsed_time(transfer.start_event) / 1e3,
-                       t_ref + ref.elapsed_time(transfer.end_event) / 1e3, time.time(),
+                       transfer.t_ret, g_start, g_end, time.time(),
                        os.getpid(), self._wait_unsubmitted, self._wait_drains,
-                       self._q_inflight_max, *self._verify_last)
+                       self._q_inflight_max, *self._verify_last, transfer.evq_hook, transfer.evq_fallback)
                 )
             if self._xfer_log is not None:
                 self._xfer_log.write(
@@ -1303,7 +1411,8 @@ class SingleDirectionOffloadingHandler:
                        os.getpid())
                 )
             self._stream_pool.append(transfer.stream)
-            self._event_pool.append(transfer.end_event)
+            if transfer.path != "ipc":
+                self._event_pool.append(transfer.end_event)
             self._event_pool.append(transfer.start_event)
             self._buffer_pool.append(
                 (transfer.batch_src, transfer.batch_dst, transfer.batch_sizes)
@@ -1342,6 +1451,8 @@ class SingleDirectionOffloadingHandler:
 
     def shutdown(self) -> None:
         """Drain this direction and release its transfer-side resources."""
+        if self._ipc is not None:
+            self._ipc.close()
         with self._lock:
             if any(not t.submitted for t in self._transfers):
                 self._pump(force=True)
@@ -1396,6 +1507,8 @@ class CPUOffloadingWorker(OffloadingWorker):
         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
         if mmap_region is not None and pin_memory:
             pin_mmap_region(mmap_region)
+        global _IPC_REGION
+        _IPC_REGION = mmap_region
 
         canonical_bytes_per_block = (
             _canonical_block_sizes(kv_caches.group_data_refs, len(kv_caches.tensors))

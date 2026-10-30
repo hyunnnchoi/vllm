@@ -72,6 +72,11 @@ class ActiveKVConnector(KVConnector):
         self.kv_connector.handle_preemptions(kv_connector_metadata)
         self.kv_connector.bind_connector_metadata(kv_connector_metadata)
         self._pending_load_kwargs = kwargs
+        # aris: the step's input copies are queued; a paced load may submit a chunk
+        # ordered after them ("evq" baseline, "in:" pacing)
+        pump = getattr(self.kv_connector, "pump_loads", None)
+        if pump is not None:
+            pump()
 
         if scheduler_output.has_sync_kv_loads:
             # Sync loads need to run before this step's forward.
