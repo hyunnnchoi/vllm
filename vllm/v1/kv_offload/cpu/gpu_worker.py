@@ -104,6 +104,27 @@ def wait_layer(job_id: int, layer_name: str, stream) -> None:
     stream.wait_event(ev if ev is not None else t.end_event)
 
 
+def _verify_load(transfer, n: int) -> tuple[int, int]:
+    """Compare n random descriptors of a finished CPU->GPU load: GPU destination
+    bytes (copied back with cuMemcpyDtoH) against the pinned CPU source."""
+    import ctypes
+    lib = ctypes.CDLL("libcuda.so.1")
+    lib.cuMemcpyDtoH_v2.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_size_t]
+    k = transfer.num_ops
+    idx = np.random.default_rng(transfer.job_id).choice(k, size=min(n, k), replace=False)
+    src = transfer.batch_src[:k].numpy()
+    dst = transfer.batch_dst[:k].numpy()
+    sizes = transfer.batch_sizes[:k].numpy()
+    bad = 0
+    for i in idx:
+        size = int(sizes[i])
+        buf = ctypes.create_string_buffer(size)
+        rc = lib.cuMemcpyDtoH_v2(buf, int(dst[i]), size)
+        if rc != 0 or buf.raw != ctypes.string_at(int(src[i]), size):
+            bad += 1
+    return len(idx), bad
+
+
 @dataclass
 class Transfer:
     job_id: int
@@ -462,6 +483,18 @@ class SingleDirectionOffloadingHandler:
         # finished loads are reported out of order.
         self._q_thread = False
         self._q_srpt = False
+        # wait() checks (logged per transfer in VLLM_KV_GPU_LOG): calls that found
+        # unsubmitted loads (the old wait() force-submitted all of them past the
+        # queue cap), calls that had to submit a requested load, and the largest
+        # number of queue-mode descriptors in flight.
+        self._wait_unsubmitted = 0
+        self._wait_drains = 0
+        self._q_inflight_max = 0
+        # VLLM_KV_VERIFY_SAMPLES=n (debug): when a load finishes, copy n random
+        # descriptors of its GPU destination back to the host and compare them
+        # byte for byte with the CPU source (logged as verify_n / verify_bad).
+        self._verify_n = int(os.environ.get("VLLM_KV_VERIFY_SAMPLES", "0"))
+        self._verify_last = (0, 0)
         self._lock = threading.RLock()
         self._bg: threading.Thread | None = None
         self._bg_device = torch.cuda.current_device() if torch.cuda.is_available() else None
@@ -1185,6 +1218,7 @@ class SingleDirectionOffloadingHandler:
                     ev.record(pending.stream)
             self._q_chunks.append((ev, n))
             in_flight += n
+            self._q_inflight_max = max(self._q_inflight_max, in_flight)
 
     def get_finished(self) -> list[TransferResult]:
         with self._lock:
@@ -1231,6 +1265,8 @@ class SingleDirectionOffloadingHandler:
                 done.append(self._transfers.popleft())
         for transfer in done:
             LW_JOBS.pop(transfer.job_id, None)
+            if self._verify_n and not self.gpu_to_cpu:
+                self._verify_last = _verify_load(transfer, self._verify_n)
             transfer_time = (
                 transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
             )  # elapsed_time is in milliseconds
@@ -1246,12 +1282,15 @@ class SingleDirectionOffloadingHandler:
                 ref, t_ref = self._gpu_ref
                 self._gpu_log.write(
                     '{"dir":"%s","job":%d,"bytes":%d,"ops":%d,"mode":"%s","t_submit":%.6f,'
-                    '"t_ret":%.6f,"g_start":%.6f,"g_end":%.6f,"t_detect":%.6f,"pid":%d}\n'
+                    '"t_ret":%.6f,"g_start":%.6f,"g_end":%.6f,"t_detect":%.6f,"pid":%d,'
+                    '"wait_unsubmitted":%d,"wait_drains":%d,"q_inflight_max":%d,'
+                    '"verify_n":%d,"verify_bad":%d}\n'
                     % (self._xfer_dir, transfer.job_id, transfer.num_bytes,
                        transfer.num_ops, transfer.path or self._mode()[0], transfer.t_submit,
                        transfer.t_ret, t_ref + ref.elapsed_time(transfer.start_event) / 1e3,
                        t_ref + ref.elapsed_time(transfer.end_event) / 1e3, time.time(),
-                       os.getpid())
+                       os.getpid(), self._wait_unsubmitted, self._wait_drains,
+                       self._q_inflight_max, *self._verify_last)
                 )
             if self._xfer_log is not None:
                 self._xfer_log.write(
@@ -1273,13 +1312,33 @@ class SingleDirectionOffloadingHandler:
         return results
 
     def wait(self, job_ids: set[int]):
+        """Block until the given jobs finish. Only this handler's requested jobs
+        are submitted; other pending loads keep their pacing and queue cap (a
+        store flush used to force-submit every pending load)."""
         with self._lock:
             if any(not t.submitted for t in self._transfers):
-                self._pump(force=True)
+                self._wait_unsubmitted += 1
+            needed = [t for t in self._transfers if not t.submitted and t.job_id in job_ids]
+            if needed:
+                self._wait_drains += 1
+                if self._mode()[0] == "queue":
+                    self._drain_queue_bounded(needed)
+                else:
+                    self._pump(force=True)
         for job_id in job_ids:
             event = self._transfer_events.get(job_id)
             if event is not None:
                 event.synchronize()
+
+    def _drain_queue_bounded(self, needed: list) -> None:
+        """Submit queue-mode loads until every transfer in `needed` is submitted,
+        never exceeding the queue cap: when the cap is full, wait for the oldest
+        in-flight chunk."""
+        while any(not t.submitted for t in needed):
+            before = sum(t.next_op for t in self._transfers)
+            self._pump_queue()
+            if sum(t.next_op for t in self._transfers) == before and self._q_chunks:
+                self._q_chunks[0][0].synchronize()
 
     def shutdown(self) -> None:
         """Drain this direction and release its transfer-side resources."""
