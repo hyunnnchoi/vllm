@@ -795,8 +795,13 @@ class SingleDirectionOffloadingHandler:
         return results
 
     def wait(self, job_ids: set[int]):
-        if any(not t.submitted for t in self._transfers):
-            self._submit_pending(force=True)
+        # A store flush also waits on this handler: submit only the requested
+        # loads, within the cap (wait for the oldest chunk when it is full).
+        while any(not t.submitted and t.job_id in job_ids for t in self._transfers):
+            submitted = sum(t.next_op for t in self._transfers)
+            self._submit_pending()
+            if sum(t.next_op for t in self._transfers) == submitted:
+                self._inflight_chunks[0][0].synchronize()
         for job_id in job_ids:
             event = self._transfer_events.get(job_id)
             if event is not None:
