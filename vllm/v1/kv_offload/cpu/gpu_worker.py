@@ -416,6 +416,9 @@ class SingleDirectionOffloadingHandler:
         # so cuMemcpyBatchAsync never waits for queue space (returns quickly)
         # while the copy engine always has work.
         self._q_chunks: deque = deque()
+        # "dma" (stock path forced onto cuMemcpyBatchAsync) and the "D" queue flag force the copy-engine path even
+        # for pages below THRESHOLD_BYTES, where vLLM would pick the Triton kernel (small-fragment comparison).
+        self._q_dma = False
         # adaptive mode (budget < 0, e.g. -80): chunk = 0.80 x link bytes/s x
         # recent engine step time, step time = EWMA of the interval between
         # get_finished() calls (one per engine step); intervals under 5 ms are
@@ -821,7 +824,9 @@ class SingleDirectionOffloadingHandler:
                     layer_groups.append([name, prev, end])
                 prev = end
         fn = self._swap_blocks_batch
-        if mode == "triton" and self._triton_fn is not None and not layerwise:
+        if mode == "dma":
+            fn = ops.swap_blocks_batch
+        elif mode == "triton" and self._triton_fn is not None and not layerwise:
             _sbt.NUM_SMS = val
             fn = self._triton_fn
         elif mode in ("tritonx", "tritongc") and self._triton_fn is not None and not layerwise:
@@ -1018,11 +1023,14 @@ class SingleDirectionOffloadingHandler:
                 cap, chunk = int(parts[0]), int(parts[1])
                 flags = parts[2] if len(parts) > 2 else ""
                 self._q_cap, self._q_chunk = cap, chunk
+                self._q_dma = "D" in flags
                 self._q_thread = "t" in flags
                 self._q_srpt = "s" in flags
                 if (self._q_thread or "e" in flags) and not self.gpu_to_cpu:
                     self._start_bg()
                 return "queue", cap
+            if raw == "dma":
+                return "dma", 0
             if raw.startswith(("triton:", "tritongc:")):
                 head, *pwj = raw.split(":")
                 return ("tritonx" if head == "triton" else "tritongc"), tuple(int(x) for x in pwj)
@@ -1041,7 +1049,7 @@ class SingleDirectionOffloadingHandler:
 
     def _pacing_setting(self) -> int:
         mode, _ = self._mode()
-        return 0 if mode in ("stock", "triton", "tritonx", "tritongc") else 1
+        return 0 if mode in ("stock", "dma", "triton", "tritonx", "tritongc") else 1
 
     def pump_at_inputs(self) -> None:
         """Called right before the forward, after the step's input copies."""
@@ -1138,7 +1146,7 @@ class SingleDirectionOffloadingHandler:
                 if _nvtx.ON:
                     torch.cuda.nvtx.range_push(
                         f"kv_submit_chunk job={pending.job_id} ops={start}:{end} inflight={in_flight} queue")
-                self._swap_blocks_batch(
+                (ops.swap_blocks_batch if self._q_dma else self._swap_blocks_batch)(
                     pending.batch_src[start:end],
                     pending.batch_dst[start:end],
                     pending.batch_sizes[start:end],
