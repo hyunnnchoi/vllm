@@ -3,6 +3,7 @@
 """Low-level CUDA/HIP memory helpers: pinning and batch DMA transfers."""
 
 import ctypes
+import threading
 import os
 import time
 from collections import deque
@@ -84,6 +85,25 @@ _LIMIT_FILE = os.environ.get("VLLM_KV_LOAD_PACE_FILE") or None
 _limit_state: dict[str, Any] = {"mtime": -1.0, "limit": (0, 0)}
 _inflight: dict[int, deque] = {}
 
+# "evq:<n>" (experiment baseline, explicit-event bounded DMA): the engine thread publishes an event recorded on the
+# compute stream right before each forward (after the step's input copies); the copy thread submits one chunk of n
+# descriptors per published step, its stream waiting on that event, with <= 2 chunks in flight. Without a new step
+# for 50 ms (no forward), a chunk goes without the event. Encoded as limit (-1, n).
+_evq_cv = threading.Condition()
+_evq_state: dict[str, Any] = {"seq": 0, "event": None}
+
+
+def publish_step_event() -> None:
+    """Engine thread, right before the forward: publish an input-ready event for the "evq" baseline."""
+    if _submit_limit()[0] != -1:
+        return
+    ev = torch.cuda.Event()
+    ev.record(torch.cuda.current_stream())
+    with _evq_cv:
+        _evq_state["seq"] += 1
+        _evq_state["event"] = ev
+        _evq_cv.notify_all()
+
 
 def _submit_limit() -> tuple[int, int]:
     if _LIMIT_FILE is None:
@@ -98,6 +118,8 @@ def _submit_limit() -> tuple[int, int]:
             if raw.startswith("ctrlq:"):
                 parts = raw[6:].split(":")
                 limit = (int(parts[0]), int(parts[1]))
+            elif raw.startswith("evq:"):
+                limit = (-1, int(raw[4:]))
             if limit != _limit_state["limit"]:
                 logger.info("SimpleCPU load submit limit (cap, chunk) = %s", limit)
             _limit_state["limit"] = limit
@@ -293,12 +315,23 @@ def copy_blocks(
     max_desc = _resolve_max_batch_descriptors()
     step = total if max_desc <= 0 else max_desc
     cap, chunk = _submit_limit() if limit else (0, 0)
-    if cap > 0:
+    if cap != 0:
         step = min(step, chunk)
         q = _inflight.setdefault(params.stream_handle, deque())
         stream = torch.cuda.ExternalStream(params.stream_handle)
+    seen = _evq_state["seq"]
     for off in range(0, total, step):
         cnt = min(step, total - off)
+        if cap == -1:
+            with _evq_cv:   # one chunk per engine step, ordered after that step's input copies
+                _evq_cv.wait_for(lambda: _evq_state["seq"] > seen, timeout=0.05)
+                ev, seen = (_evq_state["event"], _evq_state["seq"]) if _evq_state["seq"] > seen else (None, seen)
+            while len(q) >= 2 and not q[0][0].query():
+                time.sleep(0.0005)
+            while q and q[0][0].query():
+                q.popleft()
+            if ev is not None:
+                stream.wait_event(ev)
         if cap > 0:
             while q and q[0][0].query():
                 q.popleft()
@@ -322,7 +355,7 @@ def copy_blocks(
             raise RuntimeError(
                 f"batch memcpy failed: err={err} failIdx={params.fail_idx.value}"
             )
-        if cap > 0:
+        if cap != 0:
             ev = torch.cuda.Event()
             ev.record(stream)
             q.append((ev, cnt))

@@ -200,6 +200,12 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             assert isinstance(kv_connector_metadata, SimpleCPUOffloadMetadata)
             self.worker_handler.handle_preemptions(kv_connector_metadata)
 
+    def pump_loads(self) -> None:
+        """aris "evq" baseline: publish an input-ready event right before the forward."""
+        from vllm.v1.simple_kv_offload.cuda_mem_ops import publish_step_event
+
+        publish_step_event()
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         if self.worker_handler is not None:
             self.worker_handler.start_load_kv()
