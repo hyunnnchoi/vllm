@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from vllm import _custom_ops as ops
@@ -107,6 +109,19 @@ def _swap_blocks_kernel_j(
         base += nprog * J
 
 
+_UVA_DESC = os.environ.get("VLLM_KV_UVA_DESC", "0") == "1"
+
+
+def _dev_view(t: torch.Tensor) -> torch.Tensor:
+    if t.is_cuda:
+        return t
+    if t.is_pinned() and t.is_contiguous():
+        from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+        return get_accelerator_view_from_cpu_tensor(t)
+    return t.to("cuda", non_blocking=True)
+
+
 def swap_blocks_batch_j(
     src_addrs: torch.Tensor,
     dst_addrs: torch.Tensor,
@@ -122,9 +137,14 @@ def swap_blocks_batch_j(
     n = src_addrs.numel()
     if n == 0:
         return
-    s = src_addrs.to("cuda", non_blocking=True)
-    d = dst_addrs.to("cuda", non_blocking=True)
-    z = sizes.to("cuda", non_blocking=True)
+    if _UVA_DESC:
+        # read the descriptor arrays from pinned host memory through UVA, so that their upload does not go through
+        # the copy engine and wait behind an in-flight bulk DMA load of the same process
+        s, d, z = (_dev_view(t) for t in (src_addrs, dst_addrs, sizes))
+    else:
+        s = src_addrs.to("cuda", non_blocking=True)
+        d = dst_addrs.to("cuda", non_blocking=True)
+        z = sizes.to("cuda", non_blocking=True)
 
     def launch() -> None:
         _swap_blocks_kernel_j[(min(P, n),)](
