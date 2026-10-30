@@ -132,6 +132,8 @@ class Transfer:
     layer_events: dict | None = None
     layer_next: int = 0
     first_ready: bool = False
+    # path actually used for the copy ("" = the control mode); "sm" for a load routed by the "B" queue flag
+    path: str = ""
 
 
 def compute_sub_block_ptrs(
@@ -419,6 +421,10 @@ class SingleDirectionOffloadingHandler:
         # "dma" (stock path forced onto cuMemcpyBatchAsync) and the "D" queue flag force the copy-engine path even
         # for pages below THRESHOLD_BYTES, where vLLM would pick the Triton kernel (small-fragment comparison).
         self._q_dma = False
+        # "B" queue flag (use with "s"): a load that arrives while another load is still in flight is copied at once
+        # by the SM copy kernel (shape P:W:J from the 5th-7th fields, default 2:4:4) instead of queueing behind it.
+        self._q_route = False
+        self._q_route_pwj = (2, 4, 4)
         # adaptive mode (budget < 0, e.g. -80): chunk = 0.80 x link bytes/s x
         # recent engine step time, step time = EWMA of the interval between
         # get_finished() calls (one per engine step); intervals under 5 ms are
@@ -835,6 +841,17 @@ class SingleDirectionOffloadingHandler:
                 bytes_per_chunk=self._triton_fn.keywords["bytes_per_chunk"],
                 P=val[0], W=val[1], J=val[2], green=mode == "tritongc",
             )
+        route_sm = (
+            mode == "queue" and self._q_route and self._triton_fn is not None and not layerwise and op_idx > 0
+            and any(not (t.submitted and t.end_event.query()) for t in self._transfers)
+        )
+        if route_sm:
+            paced = False
+            fn = functools.partial(
+                _sbt.swap_blocks_batch_j,
+                bytes_per_chunk=self._triton_fn.keywords["bytes_per_chunk"],
+                P=self._q_route_pwj[0], W=self._q_route_pwj[1], J=self._q_route_pwj[2], green=False,
+            )
         t_call = time.time()   # before the copy call (a large batch call blocks)
         with current_platform.stream(stream):
             start_event.record(stream)
@@ -892,6 +909,7 @@ class SingleDirectionOffloadingHandler:
                 t_ret=t_ret,
                 layer_groups=layer_groups if lw_async and layer_groups else None,
                 layer_events={} if lw_async and layer_groups else None,
+                path="sm" if route_sm else "",
             )
         )
         if lw_async:
@@ -1024,6 +1042,9 @@ class SingleDirectionOffloadingHandler:
                 flags = parts[2] if len(parts) > 2 else ""
                 self._q_cap, self._q_chunk = cap, chunk
                 self._q_dma = "D" in flags
+                self._q_route = "B" in flags
+                if self._q_route and len(parts) >= 6:
+                    self._q_route_pwj = tuple(int(x) for x in parts[3:6])
                 self._q_thread = "t" in flags
                 self._q_srpt = "s" in flags
                 if (self._q_thread or "e" in flags) and not self.gpu_to_cpu:
@@ -1227,7 +1248,7 @@ class SingleDirectionOffloadingHandler:
                     '{"dir":"%s","job":%d,"bytes":%d,"ops":%d,"mode":"%s","t_submit":%.6f,'
                     '"t_ret":%.6f,"g_start":%.6f,"g_end":%.6f,"t_detect":%.6f,"pid":%d}\n'
                     % (self._xfer_dir, transfer.job_id, transfer.num_bytes,
-                       transfer.num_ops, self._mode()[0], transfer.t_submit,
+                       transfer.num_ops, transfer.path or self._mode()[0], transfer.t_submit,
                        transfer.t_ret, t_ref + ref.elapsed_time(transfer.start_event) / 1e3,
                        t_ref + ref.elapsed_time(transfer.end_event) / 1e3, time.time(),
                        os.getpid())
