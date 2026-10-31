@@ -325,6 +325,18 @@ def _new_descriptor_buffers(
     )
 
 
+def _split_descriptors(
+    src: np.ndarray, dst: np.ndarray, sizes: np.ndarray, k: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """aris/layout-ctrlpath (121): cut every copy into k contiguous pieces of
+    equal size, same bytes and order (pace control suffix "@x<k>")."""
+    piece = sizes // k
+    if np.any(piece * k != sizes) or np.any(piece % 8):
+        raise ValueError(f"split {k} needs copy sizes divisible by {8 * k}")
+    offs = np.arange(k, dtype=np.int64) * piece[:, None]
+    return (src[:, None] + offs).ravel(), (dst[:, None] + offs).ravel(), np.repeat(piece, k)
+
+
 class SingleDirectionOffloadingHandler:
     """
     Handles transfers for a single direction, either CPU->GPU or GPU->CPU.
@@ -857,6 +869,18 @@ class SingleDirectionOffloadingHandler:
         # earlier step for a since-reallocated block; with async scheduling
         # nothing else orders that zeroing against this copy.
         mode, val = self._mode() if not self.gpu_to_cpu else ("stock", 0)
+        split = getattr(self, "_split", 1) if not self.gpu_to_cpu else 1
+        if split > 1 and op_idx > 0 and not layerwise:
+            pieces = _split_descriptors(all_src[:op_idx], all_dst[:op_idx], all_sizes[:op_idx], split)
+            need = op_idx * split
+            i = next((i for i, b in enumerate(self._buffer_pool) if b[0].numel() >= need), None)
+            big = self._buffer_pool.pop(i) if i is not None else _new_descriptor_buffers(need)
+            self._buffer_pool.append((batch_src, batch_dst, batch_sizes))
+            batch_src, batch_dst, batch_sizes = big
+            op_idx = need
+            src, dst, sizes = batch_src[:op_idx], batch_dst[:op_idx], batch_sizes[:op_idx]
+            all_src, all_dst, all_sizes = src.numpy(), dst.numpy(), sizes.numpy()
+            all_src[:], all_dst[:], all_sizes[:] = pieces
         if self.gpu_to_cpu or "w" not in _io_flags.flags():
             stream.wait_stream(current_platform.current_stream())
         srpt = mode == "queue" and self._q_srpt
@@ -1111,6 +1135,8 @@ class SingleDirectionOffloadingHandler:
             except OSError:
                 pass
         raw = getattr(self, "_pace_raw", str(self._pace_bytes))
+        raw, _, xs = raw.partition("@x")
+        self._split = int(xs) if xs.isdigit() and int(xs) > 1 else 1
         self._auto_on = raw.startswith("ctrlauto")
         try:
             if self._auto_on:
