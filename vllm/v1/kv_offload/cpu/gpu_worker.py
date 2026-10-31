@@ -1415,6 +1415,7 @@ class SingleDirectionOffloadingHandler:
                 g_start, g_end = ipc_times if ipc_times is not None else (
                     t_ref + ref.elapsed_time(transfer.start_event) / 1e3,
                     t_ref + ref.elapsed_time(transfer.end_event) / 1e3)
+                g_start, g_end = (x if x == x else -1.0 for x in (g_start, g_end))   # keep the line valid JSON
                 self._gpu_log.write(
                     '{"dir":"%s","job":%d,"bytes":%d,"ops":%d,"mode":"%s","t_submit":%.6f,'
                     '"t_ret":%.6f,"g_start":%.6f,"g_end":%.6f,"t_detect":%.6f,"pid":%d,'

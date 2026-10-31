@@ -26,6 +26,31 @@ import numpy as np
 import torch
 
 
+class _IpcDone:
+    """Completion handle of one IPC load. The interprocess event alone is not enough:
+    it is recorded by the loader only after the loader receives the message, and an
+    event that was never recorded reports complete on query()/synchronize(). So a load
+    is complete when the loader's reply (sent after its copy finished) has arrived."""
+
+    def __init__(self, client: "IpcLoaderClient", job_id: int, event: torch.cuda.Event):
+        self._client, self._job, self.event = client, job_id, event
+
+    def query(self) -> bool:
+        return self._job in self._client.times and self.event.query()
+
+    def synchronize(self) -> None:
+        while self._job not in self._client.times:
+            if self._client._proc.poll() is not None:
+                raise RuntimeError("ipc loader process exited")
+            time.sleep(0.0005)
+        self.event.synchronize()
+
+    def wait(self, stream=None) -> None:
+        # GPU-side ordering after an IPC load: only another IPC load chains on it, and
+        # those run in order on the loader's single stream
+        self.event.wait(stream)
+
+
 class IpcLoaderClient:
     def __init__(self, gpu_tensors: list[torch.Tensor], region_base: int, region_size: int,
                  region_fd: int, device: int):
@@ -64,8 +89,8 @@ class IpcLoaderClient:
             self.times[job] = (g0, g1)
 
     def submit(self, job_id: int, src: np.ndarray, dst: np.ndarray, sizes: np.ndarray,
-               stream: torch.cuda.Stream) -> torch.cuda.Event:
-        """Queue one load; returns the interprocess event recorded after its copy."""
+               stream: torch.cuda.Stream) -> _IpcDone:
+        """Queue one load; returns its completion handle (loader reply + interprocess event)."""
         k = np.searchsorted(self._gpu_bases[self._order], dst, side="right") - 1
         tidx = self._order[k]
         dst_off = dst - self._gpu_bases[tidx]
@@ -79,7 +104,7 @@ class IpcLoaderClient:
             self._conn.send((job_id, src_off.astype(np.int64), tidx.astype(np.int32),
                              dst_off.astype(np.int64), sizes.astype(np.int64),
                              ready.ipc_handle(), done.ipc_handle()))
-        return done
+        return _IpcDone(self, job_id, done)
 
     def close(self) -> None:
         try:
