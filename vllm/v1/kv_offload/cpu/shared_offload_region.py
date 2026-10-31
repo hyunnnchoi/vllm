@@ -108,7 +108,13 @@ class SharedOffloadRegion:
         self._row_stride = kv_bytes_per_chunk
         self.total_size_bytes = self.num_chunks * self._row_stride
 
-        self.mmap_path = f"/dev/shm/vllm_offload_{engine_id}.mmap"
+        # aris experiment (VLLM_KV_OFFLOAD_MEMFD=1, single worker): an anonymous
+        # memfd holds the same shmem pages as a /dev/shm file without that
+        # mount's size limit (8 GiB on gpu-1); it has no path to join or unlink.
+        memfd = os.environ.get("VLLM_KV_OFFLOAD_MEMFD") == "1"
+        self.mmap_path: str | None = (
+            None if memfd else f"/dev/shm/vllm_offload_{engine_id}.mmap"
+        )
         self._creator = False  # set True only if this worker creates the file
         self.rank = rank
         if rank is not None:
@@ -118,9 +124,15 @@ class SharedOffloadRegion:
             self._worker_area_end = (rank + 1) * cpu_page_size
         try:
             try:
-                self.fd: int | None = os.open(
-                    self.mmap_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600
-                )
+                if memfd:
+                    assert rank in (None, 0), "memfd region is single-worker only"
+                    self.fd: int | None = os.memfd_create(
+                        f"vllm_offload_{engine_id}"
+                    )
+                else:
+                    self.fd = os.open(
+                        self.mmap_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600
+                    )
             except FileExistsError:
                 # Joiner path — another worker won O_EXCL. Reopen and wait
                 # for the file to reach expected size.
@@ -135,7 +147,8 @@ class SharedOffloadRegion:
                 self._creator = True
                 if creator_memory_check is not None:
                     creator_memory_check(self.total_size_bytes)
-                check_shm_free_space(self.total_size_bytes)
+                if not memfd:
+                    check_shm_free_space(self.total_size_bytes)
                 os.ftruncate(self.fd, self.total_size_bytes)
                 logger.info(
                     "Created mmap file %s (%.2f GB)",
@@ -154,10 +167,10 @@ class SharedOffloadRegion:
                 populate_write_fn = _get_populate_write_fn(self.mmap_obj)
                 populate_write_fn(self.mmap_obj, 0, self.total_size_bytes)
         except Exception:
-            if self._creator:
+            if self._creator and self.mmap_path:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(self.mmap_path)
-                self._creator = False
+            self._creator = False
             if hasattr(self, "mmap_obj") and self.mmap_obj is not None:
                 self.mmap_obj.close()
                 self.mmap_obj = None
@@ -185,19 +198,19 @@ class SharedOffloadRegion:
             try:
                 barrier()
             except Exception:
-                if self._creator:
+                if self._creator and self.mmap_path:
                     with contextlib.suppress(FileNotFoundError):
                         os.unlink(self.mmap_path)
-                    self._creator = False
+                self._creator = False
                 self.mmap_obj.close()
                 os.close(self.fd)
                 self.mmap_obj = None
                 self.fd = None
                 raise
-            if self._creator:
+            if self._creator and self.mmap_path:
                 os.unlink(self.mmap_path)
-                self._creator = False
                 logger.info("Unlinked mmap file %s", self.mmap_path)
+            self._creator = False
 
         self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
         self._views: list[torch.Tensor] = []
