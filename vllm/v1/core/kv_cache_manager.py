@@ -249,6 +249,11 @@ class KVCacheManager:
 
     def prefix_cache_lookup_enabled(self, request: Request) -> bool:
         """Whether a local prefix cache lookup may be run for this request."""
+        # aris experiment (127 injection): kv_transfer_params {"aris_cpu_only": true}
+        # skips the GPU prefix cache only, so the KV connector loads the whole
+        # stored prefix from the CPU tier (skip_reading_prefix_cache skips both)
+        if (request.kv_transfer_params or {}).get("aris_cpu_only"):
+            return False
         return self.enable_caching and not request.skip_reading_prefix_cache
 
     def record_prefix_cache_stats(self, request: Request, num_hits: int) -> None:
