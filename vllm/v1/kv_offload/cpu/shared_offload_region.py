@@ -22,6 +22,28 @@ logger = init_logger(__name__)
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
 
 
+def _open_published_memfd(path: str, expected_size: int, timeout: float = 30.0) -> int:
+    """Open the creator's memfd via /proc/<pid>/fd/<fd> once "<pid> <fd>" is
+    published in path, and wait until it has its full size."""
+    deadline = time.monotonic() + timeout
+    while True:
+        parts: list[str] = []
+        with contextlib.suppress(FileNotFoundError):
+            with open(path) as f:
+                parts = f.read().split()
+        if len(parts) == 2:
+            fd = os.open(f"/proc/{parts[0]}/fd/{parts[1]}", os.O_RDWR)
+            while os.fstat(fd).st_size < expected_size:
+                if time.monotonic() > deadline:
+                    os.close(fd)
+                    raise TimeoutError(f"memfd published in {path} never sized")
+                time.sleep(0.005)
+            return fd
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"Timed out waiting for the memfd published in {path}")
+        time.sleep(0.005)
+
+
 def _wait_for_file_size(fd: int, expected_size: int, timeout: float = 30.0) -> None:
     """Spin-wait until the file reaches expected_size (creator truncated it)."""
     deadline = time.monotonic() + timeout
@@ -108,12 +130,20 @@ class SharedOffloadRegion:
         self._row_stride = kv_bytes_per_chunk
         self.total_size_bytes = self.num_chunks * self._row_stride
 
-        # aris experiment (VLLM_KV_OFFLOAD_MEMFD=1, single worker): an anonymous
-        # memfd holds the same shmem pages as a /dev/shm file without that
-        # mount's size limit (8 GiB on gpu-1); it has no path to join or unlink.
+        # aris experiment (VLLM_KV_OFFLOAD_MEMFD=1): an anonymous memfd holds the
+        # same shmem pages as a /dev/shm file without that mount's size limit
+        # (8 GiB on gpu-1, 40 GiB on gpu). With several workers (TP), the
+        # creator publishes "<pid> <fd>" of its memfd in a small /dev/shm file
+        # that takes the place of the mmap path (so the existing unlink after
+        # the barrier removes it) and the other workers open /proc/<pid>/fd/<fd>.
         memfd = os.environ.get("VLLM_KV_OFFLOAD_MEMFD") == "1"
+        memfd_shared = memfd and rank is not None
         self.mmap_path: str | None = (
-            None if memfd else f"/dev/shm/vllm_offload_{engine_id}.mmap"
+            f"/dev/shm/vllm_offload_{engine_id}.memfd"
+            if memfd_shared
+            else None
+            if memfd
+            else f"/dev/shm/vllm_offload_{engine_id}.mmap"
         )
         self._creator = False  # set True only if this worker creates the file
         self.rank = rank
@@ -124,21 +154,36 @@ class SharedOffloadRegion:
             self._worker_area_end = (rank + 1) * cpu_page_size
         try:
             try:
-                if memfd:
-                    assert rank in (None, 0), "memfd region is single-worker only"
+                if memfd and not memfd_shared:
                     self.fd: int | None = os.memfd_create(
                         f"vllm_offload_{engine_id}"
                     )
+                elif memfd_shared:
+                    rdv = os.open(
+                        self.mmap_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+                    )
+                    try:
+                        self.fd = os.memfd_create(f"vllm_offload_{engine_id}")
+                        os.ftruncate(self.fd, self.total_size_bytes)
+                        os.write(rdv, f"{os.getpid()} {self.fd}\n".encode())
+                    finally:
+                        os.close(rdv)
                 else:
                     self.fd = os.open(
                         self.mmap_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600
                     )
             except FileExistsError:
-                # Joiner path — another worker won O_EXCL. Reopen and wait
-                # for the file to reach expected size.
-                self.fd = os.open(self.mmap_path, os.O_RDWR)
-                _wait_for_file_size(self.fd, self.total_size_bytes)
-                logger.info("Opened existing mmap file %s", self.mmap_path)
+                if memfd_shared:
+                    self.fd = _open_published_memfd(
+                        self.mmap_path, self.total_size_bytes
+                    )
+                    logger.info("Opened memfd published in %s", self.mmap_path)
+                else:
+                    # Joiner path — another worker won O_EXCL. Reopen and wait
+                    # for the file to reach expected size.
+                    self.fd = os.open(self.mmap_path, os.O_RDWR)
+                    _wait_for_file_size(self.fd, self.total_size_bytes)
+                    logger.info("Opened existing mmap file %s", self.mmap_path)
             else:
                 # Creator path. We won O_EXCL, so we own the file: any
                 # failure here must clean up so concurrent joiners don't
