@@ -167,6 +167,15 @@ class Transfer:
     evq_fallback: int = 0
     # copies before VLLM_KV_COALESCE merged them (130); num_ops is the count submitted
     ops_raw: int = 0
+    # queue flag "p" (130): the load goes as pitched 2D copies, one per block, in chunks of whole blocks.
+    # pitched = (layers, page, src pitch, dst pitch); pb_next / pb_n = blocks submitted / total; next_op
+    # follows as pb_next x layers (descriptor equivalents) for the queue cap and SRPT.
+    pitched: tuple | None = None
+    pb_next: int = 0
+    pb_n: int = 0
+    # host time of the queue-mode chunk submissions (largest single call, total)
+    pump_max_ms: float = 0.0
+    pump_sum_ms: float = 0.0
 
 
 def compute_sub_block_ptrs(
@@ -411,11 +420,14 @@ def _cudart():
     return _CUDART
 
 
-def _pitched_copies(src: torch.Tensor, dst: torch.Tensor, plan, n_blocks: int, stream) -> None:
+def _pitched_copies(src: torch.Tensor, dst: torch.Tensor, plan, n_blocks: int, stream, lo: int = 0,
+                    hi: int | None = None) -> None:
+    """Blocks lo..hi-1 (default all) of a load whose plan _pitched_plan returned; src/dst hold the layer-major
+    descriptors, so their first n_blocks entries are the layer-0 addresses of the blocks."""
     n_layers, page, sp, dp = plan
     f = _cudart().cudaMemcpy2DAsync
     s0, d0, h = src[:n_blocks].numpy(), dst[:n_blocks].numpy(), stream.cuda_stream
-    for i in range(n_blocks):
+    for i in range(lo, n_blocks if hi is None else hi):
         rc = f(int(d0[i]), dp, int(s0[i]), sp, page, n_layers, 4, h)   # 4 = cudaMemcpyDefault
         if rc:
             raise RuntimeError(f"cudaMemcpy2DAsync failed ({rc}) at block {i}")
@@ -550,6 +562,9 @@ class SingleDirectionOffloadingHandler:
         # by the SM copy kernel (shape P:W:J from the 5th-7th fields, default 2:4:4) instead of queueing behind it.
         self._q_route = False
         self._q_route_pwj = (2, 4, 4)
+        # "p" queue flag (130): loads that _pitched_plan accepts go as pitched 2D copies (one per block) in
+        # chunks of <chunk> // layers blocks, at most <cap> descriptor equivalents in flight.
+        self._q_pitched = False
         # adaptive mode (budget < 0, e.g. -80): chunk = 0.80 x link bytes/s x
         # recent engine step time, step time = EWMA of the interval between
         # get_finished() calls (one per engine step); intervals under 5 ms are
@@ -1031,6 +1046,14 @@ class SingleDirectionOffloadingHandler:
             )
         t_call = time.time()   # before the copy call (a large batch call blocks)
         pitched_path = ""
+        qplan = (
+            _pitched_plan(all_src[:op_idx], all_dst[:op_idx], all_sizes[:op_idx], num_dst_blocks)
+            if paced and mode == "queue" and self._q_pitched and not self.gpu_to_cpu and not _COALESCE
+            and not self._q_dma
+            else None
+        )
+        if qplan is not None:
+            pitched_path = "pitched2d:%d:q" % num_dst_blocks
         with current_platform.stream(stream):
             start_event.record(stream)
             if lw_async:
@@ -1099,6 +1122,8 @@ class SingleDirectionOffloadingHandler:
                 batch_sizes=batch_sizes,
                 num_ops=op_idx,
                 ops_raw=ops_raw,
+                pitched=qplan,
+                pb_n=num_dst_blocks if qplan is not None else 0,
                 next_op=0,
                 submitted=not paced and not (lw_async and layer_groups),
                 is_src_access_order_any=is_src_access_order_any,
@@ -1242,6 +1267,7 @@ class SingleDirectionOffloadingHandler:
             if self._auto_on:
                 self._q_cap, self._q_chunk = 16384, 4096
                 self._q_dma, self._q_route, self._q_thread, self._q_srpt = True, False, False, True
+                self._q_pitched = False
                 return "queue", self._q_cap
             if raw.startswith("ctrlq:"):
                 parts = raw[6:].split(":")
@@ -1254,6 +1280,7 @@ class SingleDirectionOffloadingHandler:
                     self._q_route_pwj = tuple(int(x) for x in parts[3:6])
                 self._q_thread = "t" in flags
                 self._q_srpt = "s" in flags
+                self._q_pitched = "p" in flags
                 if (self._q_thread or "e" in flags) and not self.gpu_to_cpu:
                     self._start_bg()
                 return "queue", cap
@@ -1319,6 +1346,9 @@ class SingleDirectionOffloadingHandler:
         pending = next((t for t in self._transfers if not t.submitted), None)
         if pending is None:
             return
+        if pending.pitched is not None:   # left over from a "p" queue control: finish it in blocks
+            self._pump(force=True)
+            return
         start = pending.next_op
         end = min(pending.num_ops, start + self._evq_n)
         with current_platform.stream(pending.stream):
@@ -1376,6 +1406,25 @@ class SingleDirectionOffloadingHandler:
             None,
         )
         while pending is not None:
+            if pending.pitched is not None:
+                # a queue-mode pitched load (130): its progress is in blocks, not a descriptor prefix
+                with current_platform.stream(pending.stream):
+                    if pending.pb_next == 0:
+                        prev = None
+                        for t in self._transfers:
+                            if t is pending:
+                                break
+                            prev = t
+                        if prev is not None:
+                            pending.stream.wait_event(prev.end_event)
+                    _pitched_copies(pending.batch_src, pending.batch_dst, pending.pitched, pending.pb_n,
+                                    pending.stream, pending.pb_next, pending.pb_n)
+                    pending.pb_next, pending.next_op = pending.pb_n, pending.num_ops
+                    pending.end_event.record(pending.stream)
+                    pending.submitted = True
+                    self._pace_last_event = pending.end_event
+                pending = next((t for t in self._transfers if not t.submitted), None)
+                continue
             if pending.layer_groups is not None:
                 # forced drain of a layer-wise load: submit what is left at once
                 lg, k = pending.layer_groups, pending.layer_next
@@ -1434,11 +1483,18 @@ class SingleDirectionOffloadingHandler:
                 pending = next((t for t in self._transfers if not t.submitted), None)
             if pending is None:
                 return
-            start = pending.next_op
-            n = min(self._q_chunk, pending.num_ops - start)
+            plan = pending.pitched
+            if plan is not None:
+                b0 = pending.pb_next
+                b1 = b0 + min(max(1, self._q_chunk // plan[0]), pending.pb_n - b0)
+                start, n = pending.next_op, (b1 - b0) * plan[0]
+            else:
+                start = pending.next_op
+                n = min(self._q_chunk, pending.num_ops - start)
             if in_flight + n > self._q_cap and in_flight > 0:
                 return
             end = start + n
+            t_pump = time.perf_counter()
             with current_platform.stream(pending.stream):
                 if start == 0 and not self._q_srpt:
                     prev = None
@@ -1451,14 +1507,21 @@ class SingleDirectionOffloadingHandler:
                 if _nvtx.ON:
                     torch.cuda.nvtx.range_push(
                         f"kv_submit_chunk job={pending.job_id} ops={start}:{end} inflight={in_flight} queue")
-                (ops.swap_blocks_batch if self._q_dma else self._swap_blocks_batch)(
-                    pending.batch_src[start:end],
-                    pending.batch_dst[start:end],
-                    pending.batch_sizes[start:end],
-                    is_src_access_order_any=pending.is_src_access_order_any,
-                )
+                if plan is not None:
+                    _pitched_copies(pending.batch_src, pending.batch_dst, plan, pending.pb_n, pending.stream, b0, b1)
+                    pending.pb_next = b1
+                else:
+                    (ops.swap_blocks_batch if self._q_dma else self._swap_blocks_batch)(
+                        pending.batch_src[start:end],
+                        pending.batch_dst[start:end],
+                        pending.batch_sizes[start:end],
+                        is_src_access_order_any=pending.is_src_access_order_any,
+                    )
                 if _nvtx.ON:
                     torch.cuda.nvtx.range_pop()
+                dt = (time.perf_counter() - t_pump) * 1e3
+                pending.pump_max_ms = max(pending.pump_max_ms, dt)
+                pending.pump_sum_ms += dt
                 pending.next_op = end
                 if end >= pending.num_ops:
                     pending.end_event.record(pending.stream)
@@ -1548,13 +1611,14 @@ class SingleDirectionOffloadingHandler:
                     '{"dir":"%s","job":%d,"bytes":%d,"ops":%d,"mode":"%s","t_submit":%.6f,'
                     '"t_ret":%.6f,"g_start":%.6f,"g_end":%.6f,"t_detect":%.6f,"pid":%d,'
                     '"wait_unsubmitted":%d,"wait_drains":%d,"q_inflight_max":%d,'
-                    '"verify_n":%d,"verify_bad":%d,"evq_hook":%d,"evq_fallback":%d,"ops_raw":%d}\n'
+                    '"verify_n":%d,"verify_bad":%d,"evq_hook":%d,"evq_fallback":%d,"ops_raw":%d,'
+                    '"pump_max_ms":%.3f,"pump_sum_ms":%.3f}\n'
                     % (self._xfer_dir, transfer.job_id, transfer.num_bytes,
                        transfer.num_ops, transfer.path or self._mode()[0], transfer.t_submit,
                        transfer.t_ret, g_start, g_end, time.time(),
                        os.getpid(), self._wait_unsubmitted, self._wait_drains,
                        self._q_inflight_max, *self._verify_last, transfer.evq_hook, transfer.evq_fallback,
-                       transfer.ops_raw or transfer.num_ops)
+                       transfer.ops_raw or transfer.num_ops, transfer.pump_max_ms, transfer.pump_sum_ms)
                 )
             if self._xfer_log is not None:
                 self._xfer_log.write(
