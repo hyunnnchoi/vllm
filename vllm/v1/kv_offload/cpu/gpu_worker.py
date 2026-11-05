@@ -918,7 +918,7 @@ class SingleDirectionOffloadingHandler:
             fn = functools.partial(
                 _sbt.swap_blocks_batch_j,
                 bytes_per_chunk=self._triton_fn.keywords["bytes_per_chunk"],
-                P=val[0], W=val[1], J=val[2], green=mode == "tritongc",
+                P=val[0], W=val[1], J=val[2], green=mode == "tritongc", cache=len(val) > 3 and bool(val[3]),
             )
         route_sm = (
             mode == "queue" and self._q_route and self._triton_fn is not None and not layerwise and op_idx > 0
@@ -1009,7 +1009,9 @@ class SingleDirectionOffloadingHandler:
                 layer_groups=layer_groups if lw_async and layer_groups else None,
                 layer_events={} if lw_async and layer_groups else None,
                 path="sm" if route_sm else ("ipc" if use_ipc else ("autosm" if auto_sm else (
-                    "autodma" if self._auto_on and mode == "queue" and op_idx > 0 else ""))),
+                    "autodma" if self._auto_on and mode == "queue" and op_idx > 0 else (
+                        "%s:%s" % (mode, ":".join(map(str, val)))
+                        if mode in ("tritonx", "tritongc") and op_idx > 0 and not layerwise else "")))),
             )
         )
         if lw_async:
@@ -1166,7 +1168,9 @@ class SingleDirectionOffloadingHandler:
                 return "evq", self._evq_n
             if raw.startswith(("triton:", "tritongc:")):
                 head, *pwj = raw.split(":")
-                return ("tritonx" if head == "triton" else "tritongc"), tuple(int(x) for x in pwj)
+                cache = 1 if pwj and pwj[-1] == "c" else 0   # "triton:P:W:J:c" = cache-bypass kernel (exp 129)
+                pwj = pwj[:-1] if cache else pwj
+                return ("tritonx" if head == "triton" else "tritongc"), tuple(int(x) for x in pwj) + (cache,)
             if raw.startswith("triton"):
                 return "triton", int(raw[6:])
             if raw.startswith("in:"):

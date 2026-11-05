@@ -88,6 +88,7 @@ def _swap_blocks_kernel_j(
     J: tl.constexpr,  # type: ignore[name-defined]
     WORDS: tl.constexpr,  # type: ignore[name-defined]
     TAG: tl.constexpr,  # type: ignore[name-defined]
+    CACHE: tl.constexpr,  # type: ignore[name-defined]
 ):
     pid = tl.program_id(0)
     nprog = tl.num_programs(0)
@@ -104,8 +105,14 @@ def _swap_blocks_kernel_j(
         for start in range(0, maxw, WORDS):
             idx = start + cols
             m = idx[None, :] < words[:, None]
-            d = tl.load(src[:, None] + idx[None, :], mask=m, other=0)
-            tl.store(dst[:, None] + idx[None, :], d, mask=m)
+            if CACHE:
+                # Strata-style cache bypass (experiment 129): L2-only, evict-first loads, streaming stores
+                d = tl.load(src[:, None] + idx[None, :], mask=m, other=0,
+                            cache_modifier=".cg", eviction_policy="evict_first")
+                tl.store(dst[:, None] + idx[None, :], d, mask=m, cache_modifier=".cs")
+            else:
+                d = tl.load(src[:, None] + idx[None, :], mask=m, other=0)
+                tl.store(dst[:, None] + idx[None, :], d, mask=m)
         base += nprog * J
 
 
@@ -133,6 +140,7 @@ def swap_blocks_batch_j(
     W: int,
     J: int,
     green: bool = False,
+    cache: bool = False,
 ) -> None:
     n = src_addrs.numel()
     if n == 0:
@@ -148,7 +156,7 @@ def swap_blocks_batch_j(
 
     def launch() -> None:
         _swap_blocks_kernel_j[(min(P, n),)](
-            s, d, z, n, J=J, WORDS=bytes_per_chunk // 8, TAG=int(green), num_warps=W
+            s, d, z, n, J=J, WORDS=bytes_per_chunk // 8, TAG=int(green), CACHE=int(cache), num_warps=W
         )
 
     if not green:
