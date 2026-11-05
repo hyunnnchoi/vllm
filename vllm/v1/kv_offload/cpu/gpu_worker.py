@@ -112,16 +112,22 @@ def _verify_load(transfer, n: int) -> tuple[int, int]:
     lib = ctypes.CDLL("libcuda.so.1")
     lib.cuMemcpyDtoH_v2.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_size_t]
     k = transfer.num_ops
-    idx = np.random.default_rng(transfer.job_id).choice(k, size=min(n, k), replace=False)
+    rng = np.random.default_rng(transfer.job_id)
+    # merged copies (VLLM_KV_COALESCE) can be hundreds of MiB: sample with replacement and
+    # compare one 64 KiB window at a random 8-byte-aligned offset inside each sampled copy
+    idx = rng.choice(k, size=n if _COALESCE else min(n, k), replace=_COALESCE and k < n)
     src = transfer.batch_src[:k].numpy()
     dst = transfer.batch_dst[:k].numpy()
     sizes = transfer.batch_sizes[:k].numpy()
     bad = 0
     for i in idx:
         size = int(sizes[i])
+        win = min(size, 65536)
+        off = int(rng.integers(0, (size - win) // 8 + 1)) * 8 if _COALESCE else 0
+        size = win if _COALESCE else size
         buf = ctypes.create_string_buffer(size)
-        rc = lib.cuMemcpyDtoH_v2(buf, int(dst[i]), size)
-        if rc != 0 or buf.raw != ctypes.string_at(int(src[i]), size):
+        rc = lib.cuMemcpyDtoH_v2(buf, int(dst[i]) + off, size)
+        if rc != 0 or buf.raw != ctypes.string_at(int(src[i]) + off, size):
             bad += 1
     return len(idx), bad
 
@@ -159,6 +165,8 @@ class Transfer:
     # "evq": chunks submitted from the pre-forward hook (after an input-ready event) / without it
     evq_hook: int = 0
     evq_fallback: int = 0
+    # copies before VLLM_KV_COALESCE merged them (130); num_ops is the count submitted
+    ops_raw: int = 0
 
 
 def compute_sub_block_ptrs(
@@ -335,6 +343,25 @@ def _split_descriptors(
         raise ValueError(f"split {k} needs copy sizes divisible by {8 * k}")
     offs = np.arange(k, dtype=np.int64) * piece[:, None]
     return (src[:, None] + offs).ravel(), (dst[:, None] + offs).ravel(), np.repeat(piece, k)
+
+
+# aris experiment 130 (VLLM_KV_COALESCE=1): merge copies that continue each other on both sides
+_COALESCE = os.environ.get("VLLM_KV_COALESCE", "0") == "1"
+
+
+def _coalesce_descriptors(src: np.ndarray, dst: np.ndarray, sizes: np.ndarray, n: int) -> int:
+    """aris/layout-ctrlpath (130): merge each run of copies whose source and destination ranges
+    both continue the previous copy into one copy, in place; returns the new copy count.
+    Order and bytes are unchanged; only adjacent pairs merge, so any layout is safe."""
+    s, d, z = src[:n], dst[:n], sizes[:n]
+    cont = (s[1:] == s[:-1] + z[:-1]) & (d[1:] == d[:-1] + z[:-1])
+    if not cont.any():
+        return n
+    starts = np.flatnonzero(np.concatenate(([True], ~cont)))
+    merged, s0, d0 = np.add.reduceat(z, starts), s[starts], d[starts]
+    m = len(starts)
+    src[:m], dst[:m], sizes[:m] = s0, d0, merged
+    return m
 
 
 class SingleDirectionOffloadingHandler:
@@ -842,6 +869,9 @@ class SingleDirectionOffloadingHandler:
         # Writer rotation may skip non-writer blocks, leaving op_idx below
         # the sized upper bound
         assert op_idx <= num_copy_ops
+        ops_raw = op_idx
+        if _COALESCE and op_idx > 1 and not layerwise:
+            op_idx = _coalesce_descriptors(all_src, all_dst, all_sizes, op_idx)
         src = src[:op_idx]
         dst = dst[:op_idx]
         sizes = sizes[:op_idx]
@@ -1001,6 +1031,7 @@ class SingleDirectionOffloadingHandler:
                 batch_dst=batch_dst,
                 batch_sizes=batch_sizes,
                 num_ops=op_idx,
+                ops_raw=ops_raw,
                 next_op=0,
                 submitted=not paced and not (lw_async and layer_groups),
                 is_src_access_order_any=is_src_access_order_any,
@@ -1450,12 +1481,13 @@ class SingleDirectionOffloadingHandler:
                     '{"dir":"%s","job":%d,"bytes":%d,"ops":%d,"mode":"%s","t_submit":%.6f,'
                     '"t_ret":%.6f,"g_start":%.6f,"g_end":%.6f,"t_detect":%.6f,"pid":%d,'
                     '"wait_unsubmitted":%d,"wait_drains":%d,"q_inflight_max":%d,'
-                    '"verify_n":%d,"verify_bad":%d,"evq_hook":%d,"evq_fallback":%d}\n'
+                    '"verify_n":%d,"verify_bad":%d,"evq_hook":%d,"evq_fallback":%d,"ops_raw":%d}\n'
                     % (self._xfer_dir, transfer.job_id, transfer.num_bytes,
                        transfer.num_ops, transfer.path or self._mode()[0], transfer.t_submit,
                        transfer.t_ret, g_start, g_end, time.time(),
                        os.getpid(), self._wait_unsubmitted, self._wait_drains,
-                       self._q_inflight_max, *self._verify_last, transfer.evq_hook, transfer.evq_fallback)
+                       self._q_inflight_max, *self._verify_last, transfer.evq_hook, transfer.evq_fallback,
+                       transfer.ops_raw or transfer.num_ops)
                 )
             if self._xfer_log is not None:
                 self._xfer_log.write(

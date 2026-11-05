@@ -21,6 +21,12 @@ logger = init_logger(__name__)
 # MADV_POPULATE_WRITE was added in Linux 5.14 (value 23).
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
 
+# aris experiment 130 (VLLM_KV_CPU_LAYER_MAJOR=1): each worker's tensors are laid out tensor-major
+# (all chunks of tensor 0, then all chunks of tensor 1, ...) instead of one row per chunk, so a
+# tensor's consecutive chunks are adjacent bytes and copies of consecutive chunks can merge.
+# Secondary tiers and the canonical (shared) view expect rows; they are refused in this mode.
+_LAYER_MAJOR = os.environ.get("VLLM_KV_CPU_LAYER_MAJOR", "0") == "1"
+
 
 def _open_published_memfd(path: str, expected_size: int, timeout: float = 30.0) -> int:
     """Open the creator's memfd via /proc/<pid>/fd/<fd> once "<pid> <fd>" is
@@ -147,6 +153,8 @@ class SharedOffloadRegion:
         )
         self._creator = False  # set True only if this worker creates the file
         self.rank = rank
+        self._cpu_page_size = cpu_page_size
+        self._layer_major = _LAYER_MAJOR and rank is not None
         if rank is not None:
             # byte offset to this worker's first slot within each chunk row
             self._worker_offset = rank * cpu_page_size
@@ -268,7 +276,11 @@ class SharedOffloadRegion:
 
         populate_write_fn = _get_populate_write_fn(self.mmap_obj)
 
-        if rank is not None:
+        if rank is not None and self._layer_major:
+            # Layer-major: this worker's area is one contiguous span.
+            start = rank * cpu_page_size * num_chunks
+            populate_write_fn(self.mmap_obj, start, cpu_page_size * num_chunks)
+        elif rank is not None:
             # Populate only this worker's pages (one slot per chunk row).
             worker_offset = rank * cpu_page_size
             _t0 = time.perf_counter()
@@ -327,12 +339,23 @@ class SharedOffloadRegion:
             f"{self._worker_area_end} (overflowed by "
             f"{new_offset - self._worker_area_end} bytes)"
         )
-        worker_layer_view = torch.as_strided(
-            self._base,
-            size=(self.num_chunks, tensor_page_size),
-            stride=(self._row_stride, 1),
-            storage_offset=self._worker_offset,
-        )
+        if self._layer_major:
+            # bytes of this worker's earlier tensors per chunk, times num_chunks
+            cell_offset = self._worker_offset - self.rank * self._cpu_page_size
+            worker_layer_view = torch.as_strided(
+                self._base,
+                size=(self.num_chunks, tensor_page_size),
+                stride=(tensor_page_size, 1),
+                storage_offset=(self.rank * self._cpu_page_size + cell_offset)
+                * self.num_chunks,
+            )
+        else:
+            worker_layer_view = torch.as_strided(
+                self._base,
+                size=(self.num_chunks, tensor_page_size),
+                stride=(self._row_stride, 1),
+                storage_offset=self._worker_offset,
+            )
         self._worker_offset = new_offset
         self._views.append(worker_layer_view)
         return worker_layer_view
@@ -369,6 +392,8 @@ class SharedOffloadRegion:
         Args:
             tensor_page_size: Canonical bytes per chunk for this tensor.
         """
+        if _LAYER_MAJOR:
+            raise NotImplementedError("VLLM_KV_CPU_LAYER_MAJOR=1 supports worker views only")
         new_offset = self._canonical_offset + tensor_page_size
         assert new_offset <= self._row_stride
         view = torch.as_strided(
@@ -387,6 +412,8 @@ class SharedOffloadRegion:
         Shape: (num_chunks, row_stride_bytes). Secondary tiers address
         chunk *b* as ``view[b]``.
         """
+        if _LAYER_MAJOR:
+            raise NotImplementedError("VLLM_KV_CPU_LAYER_MAJOR=1 has no chunk rows for secondary tiers")
         kv_tensor = self._base.view(self.num_chunks, self._row_stride)
         np_arr = kv_tensor.numpy()
         assert np_arr.ctypes.data == self._base.data_ptr(), (

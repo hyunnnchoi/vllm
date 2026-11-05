@@ -29,6 +29,37 @@ from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
+# aris experiment 130 (VLLM_KV_PLACE): best-effort contiguous GPU block placement.
+#   "sort"          the same blocks the free queue would give, in ascending block id
+#   "window:<f>"    up to n*(1+f) blocks from the head of the free queue are candidates; the n
+#                   returned are taken from the longest runs of consecutive ids among them
+#                   (eviction may reach f*n blocks deeper than stock), in ascending block id
+_PLACE = __import__("os").environ.get("VLLM_KV_PLACE", "")
+_PLACE_WINDOW = float(_PLACE.split(":")[1]) if _PLACE.startswith("window:") else 0.0
+
+
+def _longest_runs(cand: list[KVCacheBlock], n: int) -> list[KVCacheBlock]:
+    """Pick n of the candidate blocks from the longest runs of consecutive block ids (ties: the run
+    nearest the head of the free queue first), returned in ascending block id."""
+    pos = {b.block_id: i for i, b in enumerate(cand)}
+    by_id = {b.block_id: b for b in cand}
+    ids = sorted(pos)
+    runs: list[tuple[int, int, int, int]] = []
+    i = 0
+    while i < len(ids):
+        j = i
+        while j + 1 < len(ids) and ids[j + 1] == ids[j] + 1:
+            j += 1
+        runs.append((-(j - i + 1), min(pos[x] for x in ids[i : j + 1]), i, j))
+        i = j + 1
+    runs.sort()
+    chosen: list[int] = []
+    for _, _, i, j in runs:
+        chosen.extend(ids[i : j + 1][: n - len(chosen)])
+        if len(chosen) == n:
+            break
+    return [by_id[x] for x in sorted(chosen)]
+
 
 class BlockHashToBlockMap:
     """
@@ -675,7 +706,21 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        if _PLACE_WINDOW > 0 and num_blocks > 1:
+            q = self.free_block_queue
+            limit = min(q.num_free_blocks, num_blocks + int(num_blocks * _PLACE_WINDOW))
+            cand: list[KVCacheBlock] = []
+            b = q.fake_free_list_head.next_free_block
+            while len(cand) < limit and b is not q.fake_free_list_tail:
+                cand.append(b)
+                b = b.next_free_block
+            ret = _longest_runs(cand, num_blocks)
+            for b in ret:
+                q.remove(b)
+        else:
+            ret = self.free_block_queue.popleft_n(num_blocks)
+            if _PLACE == "sort":
+                ret.sort(key=lambda b: b.block_id)
 
         if self._reuse_watchers:
             self._notify_reuse(ret)

@@ -26,6 +26,10 @@ from vllm.v1.kv_offload.cpu.common import (
 from vllm.v1.kv_offload.cpu.policies.base import CachePolicy, ChunkStatus
 from vllm.v1.kv_offload.cpu.policies.factory import CachePolicyFactory
 
+# aris experiment 130 (VLLM_KV_PLACE set): a store's chunks are handed out in ascending chunk id,
+# so consecutive keys get consecutive CPU slots whenever the allocated set has runs
+_PLACE_SORT = bool(__import__("os").environ.get("VLLM_KV_PLACE", ""))
+
 
 class CPUOffloadingManager(OffloadingManager):
     """
@@ -91,6 +95,8 @@ class CPUOffloadingManager(OffloadingManager):
         # allocate reused chunks
         for _ in range(num_reused):
             chunks.append(ChunkStatus(self._free_list.pop()))
+        if _PLACE_SORT:
+            chunks.sort(key=lambda c: c.chunk_id)
         return chunks
 
     def _free_chunk(self, chunk: ChunkStatus) -> None:
