@@ -106,9 +106,9 @@ def _swap_blocks_kernel_j(
             idx = start + cols
             m = idx[None, :] < words[:, None]
             if CACHE:
-                # Strata-style cache bypass (experiment 129): L2-only, evict-first loads, streaming stores
-                d = tl.load(src[:, None] + idx[None, :], mask=m, other=0,
-                            cache_modifier=".cg", eviction_policy="evict_first")
+                # Strata-style cache bypass (experiment 129): L2-only (.cg) loads, streaming (.cs) stores;
+                # ptxas rejects .cg together with an evict_first eviction priority
+                d = tl.load(src[:, None] + idx[None, :], mask=m, other=0, cache_modifier=".cg")
                 tl.store(dst[:, None] + idx[None, :], d, mask=m, cache_modifier=".cs")
             else:
                 d = tl.load(src[:, None] + idx[None, :], mask=m, other=0)
