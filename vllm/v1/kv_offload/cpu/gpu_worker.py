@@ -364,6 +364,63 @@ def _coalesce_descriptors(src: np.ndarray, dst: np.ndarray, sizes: np.ndarray, n
     return m
 
 
+# aris experiment 130 (VLLM_KV_PITCHED=1): a CPU->GPU load whose copies are all layers of each block, with constant
+# per-layer pitches on both sides, goes as one pitched 2D copy per block (width = page, height = layers). Block ids
+# need not be contiguous (9-25 Idea 1; A100 pilot P5: 98% of a flat copy with 1/L of the descriptors).
+_PITCHED = os.environ.get("VLLM_KV_PITCHED", "0") == "1"
+_CUDART = None
+
+
+def _pitched_plan(src: np.ndarray, dst: np.ndarray, sizes: np.ndarray, n_blocks: int):
+    """(layers, page, src pitch, dst pitch) when the copies are ref-major, n_blocks per layer, one equal page each,
+    and every layer sits at a constant offset from the previous one on both sides; else None."""
+    k = len(sizes)
+    if n_blocks < 1 or k % n_blocks or k // n_blocks < 2:
+        return None
+    n_layers, page = k // n_blocks, int(sizes[0])
+    if not (sizes == page).all():
+        return None
+    s, d = src.reshape(n_layers, n_blocks), dst.reshape(n_layers, n_blocks)
+    sp, dp = int(s[1, 0] - s[0, 0]), int(d[1, 0] - d[0, 0])
+    if sp < page or dp < page:
+        return None
+    lay = np.arange(n_layers, dtype=np.int64)[:, None]
+    if not ((s - s[0]) == lay * sp).all() or not ((d - d[0]) == lay * dp).all():
+        return None
+    return n_layers, page, sp, dp
+
+
+def _cudart():
+    global _CUDART
+    if _CUDART is None:
+        import ctypes
+        names = ["libcudart.so.13", "libcudart.so.12",
+                 os.path.join(os.path.dirname(torch.__file__), "..", "nvidia", "cu13", "lib", "libcudart.so.13"),
+                 os.path.join(os.path.dirname(torch.__file__), "..", "nvidia", "cuda_runtime", "lib", "libcudart.so.12")]
+        for name in names:
+            try:
+                lib = ctypes.CDLL(name)
+                break
+            except OSError:
+                continue
+        else:
+            raise RuntimeError("VLLM_KV_PITCHED: libcudart not found")
+        c_sz, c_vp = ctypes.c_size_t, ctypes.c_void_p
+        lib.cudaMemcpy2DAsync.argtypes = [c_vp, c_sz, c_vp, c_sz, c_sz, c_sz, ctypes.c_int, c_vp]
+        _CUDART = lib
+    return _CUDART
+
+
+def _pitched_copies(src: torch.Tensor, dst: torch.Tensor, plan, n_blocks: int, stream) -> None:
+    n_layers, page, sp, dp = plan
+    f = _cudart().cudaMemcpy2DAsync
+    s0, d0, h = src[:n_blocks].numpy(), dst[:n_blocks].numpy(), stream.cuda_stream
+    for i in range(n_blocks):
+        rc = f(int(d0[i]), dp, int(s0[i]), sp, page, n_layers, 4, h)   # 4 = cudaMemcpyDefault
+        if rc:
+            raise RuntimeError(f"cudaMemcpy2DAsync failed ({rc}) at block {i}")
+
+
 class SingleDirectionOffloadingHandler:
     """
     Handles transfers for a single direction, either CPU->GPU or GPU->CPU.
@@ -973,6 +1030,7 @@ class SingleDirectionOffloadingHandler:
                 P=self._auto.shape[0], W=4, J=self._auto.shape[1], green=False,
             )
         t_call = time.time()   # before the copy call (a large batch call blocks)
+        pitched_path = ""
         with current_platform.stream(stream):
             start_event.record(stream)
             if lw_async:
@@ -1005,12 +1063,21 @@ class SingleDirectionOffloadingHandler:
                 if _nvtx.ON:
                     torch.cuda.nvtx.range_push(
                         f"kv_submit {xdir} job={job_id} ops={op_idx} bytes={num_transfer_bytes} mode={mode}")
-                fn(
-                    src,
-                    dst,
-                    sizes,
-                    is_src_access_order_any=is_src_access_order_any,
+                plan = (
+                    _pitched_plan(all_src[:op_idx], all_dst[:op_idx], all_sizes[:op_idx], num_dst_blocks)
+                    if _PITCHED and not self.gpu_to_cpu and not _COALESCE and fn is self._swap_blocks_batch
+                    else None
                 )
+                if plan is not None:
+                    _pitched_copies(src, dst, plan, num_dst_blocks, stream)
+                    pitched_path = "pitched2d:%d" % num_dst_blocks
+                else:
+                    fn(
+                        src,
+                        dst,
+                        sizes,
+                        is_src_access_order_any=is_src_access_order_any,
+                    )
                 if _nvtx.ON:
                     torch.cuda.nvtx.range_pop()
             if not paced and not (lw_async and layer_groups) and not use_ipc:
@@ -1039,7 +1106,7 @@ class SingleDirectionOffloadingHandler:
                 t_ret=t_ret,
                 layer_groups=layer_groups if lw_async and layer_groups else None,
                 layer_events={} if lw_async and layer_groups else None,
-                path="sm" if route_sm else ("ipc" if use_ipc else ("autosm" if auto_sm else (
+                path=pitched_path or "sm" if route_sm else pitched_path or ("ipc" if use_ipc else ("autosm" if auto_sm else (
                     "autodma" if self._auto_on and mode == "queue" and op_idx > 0 else (
                         "%s:%s" % (mode, ":".join(map(str, val)))
                         if mode in ("tritonx", "tritongc") and op_idx > 0 and not layerwise else "")))),
