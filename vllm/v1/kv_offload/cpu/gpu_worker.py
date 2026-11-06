@@ -519,6 +519,47 @@ def _staged_load(src_np: np.ndarray, dst_t: torch.Tensor, op_idx: int, n_blocks:
     return n_chunks, copies
 
 
+# aris experiment 133 (control "strata:<blocks>[:<warps>]"): bulk restore through Strata's GPU-assisted I/O kernel
+# (SGLang HiCache, strata_transfer.cu next to this file, built by nvcc into the library named by VLLM_STRATA_LIB).
+_STRATA_FN = None
+
+
+def _strata_fn():
+    global _STRATA_FN
+    if _STRATA_FN is None:
+        import ctypes
+        lib = ctypes.CDLL(os.environ["VLLM_STRATA_LIB"])
+        f = lib.strata_restore_pf_lf
+        f.restype = ctypes.c_int
+        f.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int64] * 7 + [ctypes.c_void_p]
+        _STRATA_FN = f
+    return _STRATA_FN
+
+
+def _strata_load(src_np: np.ndarray, dst_np: np.ndarray, n_blocks: int, plan, stream, block_quota: int,
+                 warps: int, keep: list) -> bool:
+    """Enqueue a CPU->GPU load on the current (transfer) stream as one launch of Strata's kernel. src_np/dst_np hold the
+    load's layer-major copy list, so their first n_blocks entries are each block's CPU row and layer-0 GPU page. The
+    kernel addresses rows as src_base + row x (layers x page) + layer x page and pages as dst_base + layer x layer
+    stride + block x page; returns False (caller copies the usual way) when the addresses do not fit that form."""
+    n_layers, page, _, layer_stride = plan
+    row = n_layers * page
+    s0 = np.ascontiguousarray(src_np[:n_blocks]).astype(np.int64)
+    d0 = np.ascontiguousarray(dst_np[:n_blocks]).astype(np.int64)
+    sb, db = int(s0.min()), int(d0.min())
+    if ((s0 - sb) % row).any() or ((d0 - db) % page).any():
+        return False
+    idx = torch.from_numpy(np.concatenate([(s0 - sb) // row, (d0 - db) // page])).pin_memory()
+    gidx = torch.empty(idx.numel(), dtype=torch.int64, device=torch.cuda.current_device())
+    gidx.copy_(idx, non_blocking=True)
+    keep.extend((idx, gidx))
+    rc = _strata_fn()(sb, db, gidx.data_ptr(), gidx.data_ptr() + 8 * n_blocks, n_blocks, n_layers, page, row,
+                      layer_stride, block_quota, warps, stream.cuda_stream)
+    if rc:
+        raise RuntimeError(f"strata kernel launch failed (cudaError {rc})")
+    return True
+
+
 class SingleDirectionOffloadingHandler:
     """
     Handles transfers for a single direction, either CPU->GPU or GPU->CPU.
@@ -656,6 +697,8 @@ class SingleDirectionOffloadingHandler:
         self._stage_buf: torch.Tensor | None = None
         self._stage_stream = None
         self._stage_warm: tuple | None = None
+        # Strata kernel restore (133): CUDA blocks and warps per block (SGLang default 2 x 32)
+        self._strata_bq, self._strata_nw = 2, 32
         # adaptive mode (budget < 0, e.g. -80): chunk = 0.80 x link bytes/s x
         # recent engine step time, step time = EWMA of the interval between
         # get_finished() calls (one per engine step); intervals under 5 ms are
@@ -1138,6 +1181,7 @@ class SingleDirectionOffloadingHandler:
         t_call = time.time()   # before the copy call (a large batch call blocks)
         pitched_path = ""
         stage_keep = None
+        strata_keep: list = []
         qplan = (
             _pitched_plan(all_src[:op_idx], all_dst[:op_idx], all_sizes[:op_idx], num_dst_blocks)
             if paced and mode == "queue" and self._q_pitched and not self.gpu_to_cpu and not _COALESCE
@@ -1180,11 +1224,15 @@ class SingleDirectionOffloadingHandler:
                         f"kv_submit {xdir} job={job_id} ops={op_idx} bytes={num_transfer_bytes} mode={mode}")
                 plan = (
                     _pitched_plan(all_src[:op_idx], all_dst[:op_idx], all_sizes[:op_idx], num_dst_blocks)
-                    if (_PITCHED or mode == "stage") and not self.gpu_to_cpu and not _COALESCE
+                    if (_PITCHED or mode in ("stage", "strata")) and not self.gpu_to_cpu and not _COALESCE
                     and fn is self._swap_blocks_batch
                     else None
                 )
-                if mode == "stage" and plan is not None and plan[2] == plan[1] and self._stage_blocks > 0:
+                if (mode == "strata" and plan is not None and plan[2] == plan[1]
+                        and _strata_load(all_src, all_dst, num_dst_blocks, plan, stream, self._strata_bq,
+                                         self._strata_nw, strata_keep)):
+                    pitched_path = "strata:%d:%d" % (self._strata_bq, self._strata_nw)
+                elif mode == "stage" and plan is not None and plan[2] == plan[1] and self._stage_blocks > 0:
                     row = plan[0] * plan[1]
                     if self._stage_buf is None or self._stage_buf.numel() < 2 * self._stage_blocks * row:
                         self._stage_buf = torch.empty(2 * self._stage_blocks * row, dtype=torch.uint8,
@@ -1228,7 +1276,7 @@ class SingleDirectionOffloadingHandler:
                 batch_sizes=batch_sizes,
                 num_ops=op_idx,
                 ops_raw=ops_raw,
-                keep=stage_keep,
+                keep=stage_keep if stage_keep is not None else (strata_keep or None),
                 pitched=qplan,
                 pb_n=num_dst_blocks if qplan is not None else 0,
                 next_op=0,
@@ -1403,6 +1451,12 @@ class SingleDirectionOffloadingHandler:
                     _stage_warmup(self.dst_tensors[0].device, self._stage_P, self._stage_W, self._stage_J)
                     self._stage_warm = (self._stage_P, self._stage_W, self._stage_J)
                 return "stage", self._stage_blocks
+            if raw.startswith("strata:"):
+                # "strata:<blocks>[:<warps>]" bulk restore through Strata's kernel (133), SGLang default 2 x 32
+                parts = [int(x) for x in raw.split(":")[1:]]
+                self._strata_bq = parts[0]
+                self._strata_nw = parts[1] if len(parts) > 1 else 32
+                return "strata", self._strata_bq
             if raw == "dma":
                 return "dma", 0
             if raw == "ipc":
@@ -1430,7 +1484,7 @@ class SingleDirectionOffloadingHandler:
 
     def _pacing_setting(self) -> int:
         mode, _ = self._mode()
-        return 0 if mode in ("stock", "dma", "triton", "tritonx", "tritongc", "stage") else 1
+        return 0 if mode in ("stock", "dma", "triton", "tritonx", "tritongc", "stage", "strata") else 1
 
     def pump_at_inputs(self) -> None:
         """Called right before the forward, after the step's input copies."""
