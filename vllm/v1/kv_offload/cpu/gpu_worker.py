@@ -16,7 +16,7 @@ import torch
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.triton_utils import HAS_TRITON, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.kv_offload.base import (
@@ -176,6 +176,8 @@ class Transfer:
     # host time of the queue-mode chunk submissions (largest single call, total)
     pump_max_ms: float = 0.0
     pump_sum_ms: float = 0.0
+    # staged load (132): host descriptor arrays and the GPU destination table, held until the transfer finishes
+    keep: list | None = None
 
 
 def compute_sub_block_ptrs(
@@ -433,6 +435,90 @@ def _pitched_copies(src: torch.Tensor, dst: torch.Tensor, plan, n_blocks: int, s
             raise RuntimeError(f"cudaMemcpy2DAsync failed ({rc}) at block {i}")
 
 
+# aris experiment 132 (control "ctrlstage:<B>:<P>[:<W>:<J>]", or "stage:..." without the SM control path): a CPU->GPU
+# load whose 48 per-layer pages of each block sit in one contiguous CPU row (chunk-major tier, _pitched_plan with
+# src pitch == page) is copied by DMA one row per block (rows of consecutive chunks merged) into a GPU staging buffer
+# of two halves of B rows; a Triton kernel with P programs then scatters each half's pages to their places in the
+# default GPU layout, inside HBM. DMA (transfer stream) and scatter (one stream per handler) are chained with events at
+# submit time, the halves alternating, so nothing is refilled later. On H100 the copy engine slows under decode load
+# for every far jump inside a copy (exp 130); the staging DMA has none.
+if HAS_TRITON:
+
+    @triton.jit(do_not_specialize=["n_jobs", "n_blocks", "b0"])
+    def _stage_scatter_kernel(stage, dst_tab, n_jobs, n_layers, n_blocks, b0, page_words,
+                              J: tl.constexpr, WORDS: tl.constexpr):
+        pid = tl.program_id(0)
+        nprog = tl.num_programs(0)
+        rows = tl.arange(0, J)
+        cols = tl.arange(0, WORDS)
+        base = pid * J
+        while base < n_jobs:
+            jobs = base + rows
+            jm = jobs < n_jobs
+            blk = jobs // n_layers
+            lay = jobs - blk * n_layers
+            src = stage + jobs.to(tl.int64) * page_words
+            dst = tl.load(dst_tab + (lay * n_blocks + b0 + blk), mask=jm, other=0).to(tl.pointer_type(tl.int64))
+            for start in range(0, page_words, WORDS):
+                idx = start + cols
+                m = jm[:, None] & (idx[None, :] < page_words)
+                d = tl.load(src[:, None] + idx[None, :], mask=m, other=0)
+                tl.store(dst[:, None] + idx[None, :], d, mask=m)
+            base += nprog * J
+
+
+def _stage_warmup(device, P: int, W: int, J: int) -> None:
+    """Compile the scatter kernel once (n_jobs = 0 launches no work)."""
+    if not HAS_TRITON:
+        return
+    buf = torch.zeros(8, dtype=torch.int64, device=device)
+    _stage_scatter_kernel[(P,)](buf, buf, 0, 48, 8840, 0, 8192, J=J, WORDS=1024, num_warps=W)
+
+
+def _staged_load(src_np: np.ndarray, dst_t: torch.Tensor, op_idx: int, n_blocks: int, plan, stream, scatter_stream,
+                 end_event, stage_buf: torch.Tensor, stage_blocks: int, P: int, W: int, J: int, keep: list):
+    """Enqueue a staged load (see above). src_np/dst_t hold the load's layer-major copy list (row bases are the
+    layer-0 entries of src); end_event is recorded on scatter_stream after the last scatter. Returns (halves filled,
+    DMA copies). Host arrays handed to the DMA call are appended to keep (held until the transfer finishes)."""
+    n_layers, page, _, _ = plan
+    row = n_layers * page
+    half = stage_blocks * row
+    base = stage_buf.data_ptr()
+    stage64 = stage_buf.view(torch.int64)
+    dst_tab = torch.empty(op_idx, dtype=torch.int64, device=stage_buf.device)
+    dst_tab.copy_(dst_t[:op_idx].view(torch.int64), non_blocking=True)   # on the transfer stream, first
+    dst_tab.record_stream(scatter_stream)
+    keep.append(dst_tab)
+    rows = np.ascontiguousarray(src_np[:n_blocks]).astype(np.int64)
+    n_chunks = (n_blocks + stage_blocks - 1) // stage_blocks
+    scattered, copies = [], 0
+    for j in range(n_chunks):
+        b0, b1 = j * stage_blocks, min(n_blocks, (j + 1) * stage_blocks)
+        h = j % 2
+        if j >= 2:
+            stream.wait_event(scattered[j - 2])   # this half is free again
+        nb = b1 - b0
+        s = rows[b0:b1].copy()
+        d = base + h * half + np.arange(nb, dtype=np.int64) * row
+        z = np.full(nb, row, dtype=np.int64)
+        m = _coalesce_descriptors(s, d, z, nb)
+        copies += m
+        st, dt_, zt = torch.from_numpy(s[:m]), torch.from_numpy(d[:m]), torch.from_numpy(z[:m])
+        keep.extend((st, dt_, zt))
+        ops.swap_blocks_batch(st, dt_, zt, is_src_access_order_any=True)
+        landed = torch.Event()
+        landed.record(stream)
+        scatter_stream.wait_event(landed)
+        with torch.cuda.stream(scatter_stream):
+            _stage_scatter_kernel[(P,)](stage64[h * half // 8:], dst_tab, nb * n_layers, n_layers, n_blocks, b0,
+                                        page // 8, J=J, WORDS=1024, num_warps=W)
+        done = torch.Event()
+        done.record(scatter_stream)
+        scattered.append(done)
+    end_event.record(scatter_stream)
+    return n_chunks, copies
+
+
 class SingleDirectionOffloadingHandler:
     """
     Handles transfers for a single direction, either CPU->GPU or GPU->CPU.
@@ -565,6 +651,11 @@ class SingleDirectionOffloadingHandler:
         # "p" queue flag (130): loads that _pitched_plan accepts go as pitched 2D copies (one per block) in
         # chunks of <chunk> // layers blocks, at most <cap> descriptor equivalents in flight.
         self._q_pitched = False
+        # staged load (132): rows per staging half, scatter kernel programs / warps / jobs per step, buffers
+        self._stage_blocks, self._stage_P, self._stage_W, self._stage_J = 0, 16, 4, 4
+        self._stage_buf: torch.Tensor | None = None
+        self._stage_stream = None
+        self._stage_warm: tuple | None = None
         # adaptive mode (budget < 0, e.g. -80): chunk = 0.80 x link bytes/s x
         # recent engine step time, step time = EWMA of the interval between
         # get_finished() calls (one per engine step); intervals under 5 ms are
@@ -1046,6 +1137,7 @@ class SingleDirectionOffloadingHandler:
             )
         t_call = time.time()   # before the copy call (a large batch call blocks)
         pitched_path = ""
+        stage_keep = None
         qplan = (
             _pitched_plan(all_src[:op_idx], all_dst[:op_idx], all_sizes[:op_idx], num_dst_blocks)
             if paced and mode == "queue" and self._q_pitched and not self.gpu_to_cpu and not _COALESCE
@@ -1088,10 +1180,24 @@ class SingleDirectionOffloadingHandler:
                         f"kv_submit {xdir} job={job_id} ops={op_idx} bytes={num_transfer_bytes} mode={mode}")
                 plan = (
                     _pitched_plan(all_src[:op_idx], all_dst[:op_idx], all_sizes[:op_idx], num_dst_blocks)
-                    if _PITCHED and not self.gpu_to_cpu and not _COALESCE and fn is self._swap_blocks_batch
+                    if (_PITCHED or mode == "stage") and not self.gpu_to_cpu and not _COALESCE
+                    and fn is self._swap_blocks_batch
                     else None
                 )
-                if plan is not None:
+                if mode == "stage" and plan is not None and plan[2] == plan[1] and self._stage_blocks > 0:
+                    row = plan[0] * plan[1]
+                    if self._stage_buf is None or self._stage_buf.numel() < 2 * self._stage_blocks * row:
+                        self._stage_buf = torch.empty(2 * self._stage_blocks * row, dtype=torch.uint8,
+                                                      device=self.dst_tensors[0].device)
+                    if self._stage_stream is None:
+                        self._stage_stream = torch.cuda.Stream(device=self.dst_tensors[0].device)
+                    stage_keep = []
+                    n_half, n_dma = _staged_load(all_src, dst, op_idx, num_dst_blocks, plan, stream,
+                                                 self._stage_stream, end_event, self._stage_buf,
+                                                 self._stage_blocks, self._stage_P, self._stage_W,
+                                                 self._stage_J, stage_keep)
+                    pitched_path = "stage:%d:%d" % (n_half, n_dma)
+                elif plan is not None and _PITCHED:
                     _pitched_copies(src, dst, plan, num_dst_blocks, stream)
                     pitched_path = "pitched2d:%d" % num_dst_blocks
                 else:
@@ -1103,8 +1209,8 @@ class SingleDirectionOffloadingHandler:
                     )
                 if _nvtx.ON:
                     torch.cuda.nvtx.range_pop()
-            if not paced and not (lw_async and layer_groups) and not use_ipc:
-                end_event.record(stream)
+            if not paced and not (lw_async and layer_groups) and not use_ipc and stage_keep is None:
+                end_event.record(stream)   # a staged load recorded it on the scatter stream
         t_ret = time.time()
         self._ref_ends = None
 
@@ -1122,6 +1228,7 @@ class SingleDirectionOffloadingHandler:
                 batch_sizes=batch_sizes,
                 num_ops=op_idx,
                 ops_raw=ops_raw,
+                keep=stage_keep,
                 pitched=qplan,
                 pb_n=num_dst_blocks if qplan is not None else 0,
                 next_op=0,
@@ -1284,6 +1391,18 @@ class SingleDirectionOffloadingHandler:
                 if (self._q_thread or "e" in flags) and not self.gpu_to_cpu:
                     self._start_bg()
                 return "queue", cap
+            if raw.startswith(("ctrlstage:", "stage:")):
+                # "ctrlstage:<B>:<P>[:<W>:<J>]" staged load + SM control path (ctrl_uva sees the "ctrl" prefix);
+                # "stage:..." the same without the SM control path
+                parts = [int(x) for x in raw.split(":")[1:]]
+                self._stage_blocks = parts[0]
+                self._stage_P = parts[1] if len(parts) > 1 else 16
+                self._stage_W = parts[2] if len(parts) > 2 else 4
+                self._stage_J = parts[3] if len(parts) > 3 else 4
+                if not self.gpu_to_cpu and self._stage_warm != (self._stage_P, self._stage_W, self._stage_J):
+                    _stage_warmup(self.dst_tensors[0].device, self._stage_P, self._stage_W, self._stage_J)
+                    self._stage_warm = (self._stage_P, self._stage_W, self._stage_J)
+                return "stage", self._stage_blocks
             if raw == "dma":
                 return "dma", 0
             if raw == "ipc":
@@ -1311,7 +1430,7 @@ class SingleDirectionOffloadingHandler:
 
     def _pacing_setting(self) -> int:
         mode, _ = self._mode()
-        return 0 if mode in ("stock", "dma", "triton", "tritonx", "tritongc") else 1
+        return 0 if mode in ("stock", "dma", "triton", "tritonx", "tritongc", "stage") else 1
 
     def pump_at_inputs(self) -> None:
         """Called right before the forward, after the step's input copies."""
