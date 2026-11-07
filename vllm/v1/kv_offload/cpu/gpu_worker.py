@@ -521,19 +521,53 @@ def _staged_load(src_np: np.ndarray, dst_t: torch.Tensor, op_idx: int, n_blocks:
 
 # aris experiment 133 (control "strata:<blocks>[:<warps>]"): bulk restore through Strata's GPU-assisted I/O kernel
 # (SGLang HiCache, strata_transfer.cu next to this file, built by nvcc into the library named by VLLM_STRATA_LIB).
-_STRATA_FN = None
+# 135: the library also exports strata_restore_pf_pf, the same kernel for a block-outer GPU KV cache (BLHNC).
+_STRATA_FN: dict = {}
 
 
-def _strata_fn():
-    global _STRATA_FN
-    if _STRATA_FN is None:
+def _strata_fn(name: str = "strata_restore_pf_lf"):
+    if name not in _STRATA_FN:
         import ctypes
         lib = ctypes.CDLL(os.environ["VLLM_STRATA_LIB"])
-        f = lib.strata_restore_pf_lf
+        f = getattr(lib, name)
         f.restype = ctypes.c_int
         f.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int64] * 7 + [ctypes.c_void_p]
-        _STRATA_FN = f
-    return _STRATA_FN
+        _STRATA_FN[name] = f
+    return _STRATA_FN[name]
+
+
+# aris experiment 135: (layers, page bytes per layer) of a packed block-outer KV cache (e.g. VLLM_KV_CACHE_LAYOUT=BLHNC),
+# which the offloading worker moves as one region of layers x page bytes per block; set by offloading/worker.py.
+PACKED_LAYERS: tuple[int, int] | None = None
+
+
+def _strata_load_packed(src_np: np.ndarray, dst_np: np.ndarray, sizes_np: np.ndarray, stream, block_quota: int,
+                        warps: int, keep: list) -> bool:
+    """135: Strata restore for a packed block-outer KV cache. Every copy is one whole block of PACKED_LAYERS = (layers,
+    page) bytes on both sides, so Strata's kernel runs with page-first offsets on both sides (strata_restore_pf_pf): one
+    item per block looping over its layers, as in the default layout, with the destination block contiguous. Returns
+    False (caller copies the usual way) when the copies do not have that form."""
+    if PACKED_LAYERS is None or len(sizes_np) == 0:
+        return False
+    n_layers, page = PACKED_LAYERS
+    row = n_layers * page
+    if not (np.asarray(sizes_np) == row).all():
+        return False
+    s0 = np.ascontiguousarray(src_np).astype(np.int64)
+    d0 = np.ascontiguousarray(dst_np).astype(np.int64)
+    sb, db = int(s0.min()), int(d0.min())
+    if ((s0 - sb) % row).any() or ((d0 - db) % row).any():
+        return False
+    n = len(s0)
+    idx = torch.from_numpy(np.concatenate([(s0 - sb) // row, (d0 - db) // row])).pin_memory()
+    gidx = torch.empty(idx.numel(), dtype=torch.int64, device=torch.cuda.current_device())
+    gidx.copy_(idx, non_blocking=True)
+    keep.extend((idx, gidx))
+    rc = _strata_fn("strata_restore_pf_pf")(sb, db, gidx.data_ptr(), gidx.data_ptr() + 8 * n, n, n_layers, page, row,
+                                            row, block_quota, warps, stream.cuda_stream)
+    if rc:
+        raise RuntimeError(f"strata kernel launch failed (cudaError {rc})")
+    return True
 
 
 def _strata_load(src_np: np.ndarray, dst_np: np.ndarray, n_blocks: int, plan, stream, block_quota: int,
@@ -1232,6 +1266,11 @@ class SingleDirectionOffloadingHandler:
                         and _strata_load(all_src, all_dst, num_dst_blocks, plan, stream, self._strata_bq,
                                          self._strata_nw, strata_keep)):
                     pitched_path = "strata:%d:%d" % (self._strata_bq, self._strata_nw)
+                elif (mode == "strata" and plan is None and not self.gpu_to_cpu and not _COALESCE
+                        and fn is self._swap_blocks_batch
+                        and _strata_load_packed(all_src[:op_idx], all_dst[:op_idx], all_sizes[:op_idx], stream,
+                                                self._strata_bq, self._strata_nw, strata_keep)):
+                    pitched_path = "strata_pf:%d:%d" % (self._strata_bq, self._strata_nw)   # 135: BLHNC
                 elif mode == "stage" and plan is not None and plan[2] == plan[1] and self._stage_blocks > 0:
                     row = plan[0] * plan[1]
                     if self._stage_buf is None or self._stage_buf.numel() < 2 * self._stage_blocks * row:

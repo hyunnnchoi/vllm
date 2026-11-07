@@ -158,6 +158,16 @@ class OffloadingConnectorWorker:
             (tensor,) = tensors_per_block[packed_layer_name]
             num_blocks = tensor.shape[0]
             block_stride = tensor.stride(0)
+            # aris experiment 135: layers and per-layer page of the packed block, for the Strata restore path
+            from vllm.v1.kv_offload.cpu import gpu_worker as _cpu_gw
+
+            pages = {page_size_bytes[n] for n in tensors_per_block}
+            n_layers = len(tensors_per_block)
+            _cpu_gw.PACKED_LAYERS = (
+                (n_layers, pages.pop())
+                if len(pages) == 1 and n_layers * page_size_bytes[packed_layer_name] == block_stride
+                else None
+            )
             packed_tensor = tensor.as_strided(
                 (num_blocks, block_stride),
                 (block_stride, 1),

@@ -122,3 +122,24 @@ extern "C" int strata_restore_pf_lf(const void* src_base, void* dst_base, const 
           item_size, src_page_dim, dst_layer_dim, nullptr, nullptr, nullptr, nullptr);
   return static_cast<int>(cudaGetLastError());
 }
+
+// aris experiment 135: the same kernel for a block-outer GPU KV cache (VLLM_KV_CACHE_LAYOUT=BLHNC), where a block's layers
+// sit in one row of dst_page_dim bytes on the GPU as well. The device code is unchanged; only the destination offset
+// function becomes SGLang's page-first one (get_global_offset_pf on both sides), so the work items stay the same as in
+// strata_restore_pf_lf: one item per block, each looping over its layers with item_size bytes per layer. Same launch
+// geometry. Returns the cudaError_t of the launch.
+extern "C" int strata_restore_pf_pf(const void* src_base, void* dst_base, const int64_t* src_indices,
+                                    const int64_t* dst_indices, int64_t num_items, int64_t num_layers,
+                                    int64_t item_size, int64_t src_page_dim, int64_t dst_page_dim,
+                                    int64_t block_quota, int64_t num_warps_per_block, void* stream) {
+  if (num_items <= 0) return 0;
+  auto div_up = [](int64_t x, int64_t y) { return (x + y - 1) / y; };
+  const int64_t items_per_warp = div_up(num_items, block_quota * num_warps_per_block);
+  const int32_t num_blocks = div_up(num_items, items_per_warp * num_warps_per_block);
+  const int32_t threads_per_block = num_warps_per_block * WARP_SIZE;
+  transfer_kernel_impl<get_global_offset_pf<const char>, get_global_offset_pf<char>, true>
+      <<<num_blocks, threads_per_block, 0, static_cast<cudaStream_t>(stream)>>>(
+          src_base, dst_base, nullptr, nullptr, src_indices, dst_indices, 0, num_layers, num_items, items_per_warp,
+          item_size, src_page_dim, dst_page_dim, nullptr, nullptr, nullptr, nullptr);
+  return static_cast<int>(cudaGetLastError());
+}
