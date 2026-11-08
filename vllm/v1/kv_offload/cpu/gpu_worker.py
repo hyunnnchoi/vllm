@@ -178,6 +178,8 @@ class Transfer:
     pump_sum_ms: float = 0.0
     # staged load (132): host descriptor arrays and the GPU destination table, held until the transfer finishes
     keep: list | None = None
+    # E2 staged SRPT job (_StageJob): submitted half by half by _pump_stage; `submitted` turns True after the last half
+    stage_job: object | None = None
 
 
 def compute_sub_block_ptrs(
@@ -519,6 +521,132 @@ def _staged_load(src_np: np.ndarray, dst_t: torch.Tensor, op_idx: int, n_blocks:
     return n_chunks, copies
 
 
+# aris E2 (control "ctrlstage:<B>:<P>[:<W>:<J>]:s"): the staged load above with shortest-remaining-first order between
+# restores, one staging half at a time. Every job's DMA runs on one DMA stream (submit order = DMA order) into slot
+# g % 2 (g = global half count) after that slot's last scatter, and its scatter runs on the scatter stream after the DMA
+# lands. At most two halves are submitted but not yet scattered, so a newly queued short restore waits for at most two
+# halves. A job's end event is recorded after its last scatter and only then is the job marked submitted: pooled end
+# events were recorded by earlier transfers, so an end event alone never says that a queued job finished.
+@dataclass(eq=False)
+class _StageJob:
+    rows: np.ndarray              # CPU row base of each block (the layer-0 entries of the layer-major copy list)
+    dst_tab: torch.Tensor         # GPU destination of every page, layer-major, on the GPU
+    n_blocks: int
+    plan: tuple                   # (layers, page, src pitch, dst pitch) from _pitched_plan
+    B: int                        # rows per staging half
+    P: int
+    W: int
+    J: int
+    ready: torch.Event            # after the destination table upload (and the transfer stream's compute barrier)
+    end_event: torch.Event
+    keep: list                    # host descriptor arrays and dst_tab, held until the transfer finishes
+    n_halves: int = 0
+    next: int = 0                 # halves submitted
+    copies: int = 0               # DMA copies after merging consecutive rows
+    seq: int = 0                  # arrival order (ties)
+    submitted: bool = False
+    host_max_ms: float = 0.0      # host time of the half submissions (largest, total)
+    host_sum_ms: float = 0.0
+    transfer: object = None
+
+
+class _StageQueue:
+    """Jobs of the E2 staged restore. Callers hold the handler lock."""
+
+    def __init__(self):
+        self.jobs: list[_StageJob] = []
+        self.inflight: deque = deque()            # done events of halves submitted but not yet scattered
+        self.slot_free: list = [None, None]       # last scatter (or fence) per staging slot
+        self.halves = 0
+        self.seq = 0
+        self.B = 0
+        self.dma_stream = None
+
+    def pending(self) -> bool:
+        return bool(self.jobs)
+
+    def fence(self, event) -> None:
+        """Both slots stay busy until `event` (a FIFO staged load's end event, or the end of the scatter stream)."""
+        self.slot_free = [event, event]
+
+    def add(self, job: _StageJob, stage_buf: torch.Tensor, scatter_stream) -> None:
+        job.n_halves = (job.n_blocks + job.B - 1) // job.B
+        if job.B != self.B and (self.jobs or self.inflight):
+            # a different half size moves the slot boundaries: submit what is queued and start after all of it
+            self.pump(stage_buf, scatter_stream, force=True)
+            tail = torch.Event()
+            tail.record(scatter_stream)
+            self.fence(tail)
+        self.B = job.B
+        if self.dma_stream is None:
+            self.dma_stream = torch.cuda.Stream(device=stage_buf.device)
+        job.seq = self.seq
+        self.seq += 1
+        self.jobs.append(job)
+
+    def pump(self, stage_buf: torch.Tensor, scatter_stream, force: bool = False) -> list[_StageJob]:
+        """Submit halves, shortest remaining job first (ties: earliest), at most two in flight (all with force).
+        Returns the jobs whose last half was submitted (end event recorded) by this call."""
+        while self.inflight and self.inflight[0].query():
+            self.inflight.popleft()
+        finished = []
+        while self.jobs and (force or len(self.inflight) < 2):
+            # a job joins once its destination table and compute barrier are done (ready), so that a new job's wait
+            # never holds up the DMA stream that the running job's halves share (with force every job joins: the
+            # DMA stream then waits on the GPU)
+            cands = [j for j in self.jobs if force or j.next > 0 or j.ready.query()]
+            if not cands:
+                break
+            job = min(cands, key=lambda j: (j.n_halves - j.next, j.seq))
+            self._submit_half(job, stage_buf, scatter_stream)
+            if job.next == job.n_halves:
+                job.end_event.record(scatter_stream)
+                job.submitted = True
+                self.jobs.remove(job)
+                finished.append(job)
+        return finished
+
+    def _submit_half(self, job: _StageJob, stage_buf: torch.Tensor, scatter_stream) -> None:
+        t0 = time.perf_counter()
+        n_layers, page, _, _ = job.plan
+        row = n_layers * page
+        half = job.B * row
+        j = job.next
+        b0, b1 = j * job.B, min(job.n_blocks, (j + 1) * job.B)
+        nb = b1 - b0
+        h = self.halves % 2
+        s = job.rows[b0:b1].copy()
+        d = stage_buf.data_ptr() + h * half + np.arange(nb, dtype=np.int64) * row
+        z = np.full(nb, row, dtype=np.int64)
+        m = _coalesce_descriptors(s, d, z, nb)
+        st, dt_, zt = torch.from_numpy(s[:m]), torch.from_numpy(d[:m]), torch.from_numpy(z[:m])
+        job.keep.extend((st, dt_, zt))
+        ds = self.dma_stream
+        if j == 0:
+            ds.wait_event(job.ready)
+        if self.slot_free[h] is not None:
+            ds.wait_event(self.slot_free[h])   # this slot's last scatter (or a fence)
+        with torch.cuda.stream(ds):
+            ops.swap_blocks_batch(st, dt_, zt, is_src_access_order_any=True)
+            landed = torch.Event()
+            landed.record(ds)
+        scatter_stream.wait_event(landed)
+        stage64 = stage_buf.view(torch.int64)
+        with torch.cuda.stream(scatter_stream):
+            _stage_scatter_kernel[(job.P,)](stage64[h * half // 8:], job.dst_tab, nb * n_layers, n_layers, job.n_blocks,
+                                            b0, page // 8, J=job.J, WORDS=1024, num_warps=job.W)
+        done = torch.Event()
+        done.record(scatter_stream)
+        self.slot_free[h] = done
+        self.inflight.append(done)
+        self.halves += 1
+        job.next += 1
+        job.copies += m
+        dt = (time.perf_counter() - t0) * 1e3
+        job.host_max_ms = max(job.host_max_ms, dt)
+        job.host_sum_ms += dt
+
+
 # aris experiment 133 (control "strata:<blocks>[:<warps>]"): bulk restore through Strata's GPU-assisted I/O kernel
 # (SGLang HiCache, strata_transfer.cu next to this file, built by nvcc into the library named by VLLM_STRATA_LIB).
 # 135: the library also exports strata_restore_pf_pf, the same kernel for a block-outer GPU KV cache (BLHNC).
@@ -731,6 +859,12 @@ class SingleDirectionOffloadingHandler:
         self._stage_buf: torch.Tensor | None = None
         self._stage_stream = None
         self._stage_warm: tuple | None = None
+        # E2: "s" flag on ctrlstage = SRPT between staged restores (_StageQueue); fallback = loads in that mode that
+        # could not be staged (submitted after every queued staged half, logged per transfer)
+        self._stage_srpt = False
+        self._sq = _StageQueue()
+        self._sq_used = False
+        self._sq_fallback = 0
         # Strata kernel restore (133): CUDA blocks and warps per block (SGLang default 2 x 32)
         self._strata_bq, self._strata_nw = 2, 32
         # adaptive mode (budget < 0, e.g. -80): chunk = 0.80 x link bytes/s x
@@ -1153,7 +1287,28 @@ class SingleDirectionOffloadingHandler:
             all_src[:], all_dst[:], all_sizes[:] = pieces
         if self.gpu_to_cpu or "w" not in _io_flags.flags():
             stream.wait_stream(current_platform.current_stream())
-        srpt = mode == "queue" and self._q_srpt
+        # E2: decide here whether this load is a staged SRPT job. Any other load that comes while staged SRPT work
+        # exists (a fallback in that mode, or any load after the control changed) is ordered after every staged half:
+        # the queued staged jobs are submitted first (so no end event is waited on before it is recorded), and the
+        # load waits for the end of the scatter stream (the last transfer's end event may not be the last scatter).
+        t_stage = time.time()   # a staged load's submit time starts before its plan, as before E2
+        splan = (
+            _pitched_plan(all_src[:op_idx], all_dst[:op_idx], all_sizes[:op_idx], num_dst_blocks)
+            if mode == "stage" and op_idx > 0 and not layerwise and not _COALESCE else None
+        )
+        stage_ok = splan is not None and splan[2] == splan[1] and self._stage_blocks > 0
+        stage_srpt = stage_ok and self._stage_srpt
+        if mode == "stage" and self._stage_srpt and op_idx > 0 and not stage_ok:
+            self._sq_fallback += 1
+        if not stage_srpt and self._sq_used:
+            with self._lock:
+                if self._sq.pending():
+                    self._pump_stage(force=True)
+            if self._stage_stream is not None:
+                tail = torch.Event()
+                tail.record(self._stage_stream)
+                stream.wait_event(tail)
+        srpt = (mode == "queue" and self._q_srpt) or stage_srpt
         if self._transfers and not srpt:
             last_transfer: Transfer = self._transfers[-1]
             last_event = last_transfer.end_event
@@ -1212,9 +1367,10 @@ class SingleDirectionOffloadingHandler:
                 bytes_per_chunk=self._triton_fn.keywords["bytes_per_chunk"],
                 P=self._auto.shape[0], W=4, J=self._auto.shape[1], green=False,
             )
-        t_call = time.time()   # before the copy call (a large batch call blocks)
+        t_call = t_stage if mode == "stage" else time.time()   # before the copy call (a large batch call blocks)
         pitched_path = ""
         stage_keep = None
+        stage_job = None
         strata_keep: list = []
         qplan = (
             _pitched_plan(all_src[:op_idx], all_dst[:op_idx], all_sizes[:op_idx], num_dst_blocks)
@@ -1256,9 +1412,9 @@ class SingleDirectionOffloadingHandler:
                 if _nvtx.ON:
                     torch.cuda.nvtx.range_push(
                         f"kv_submit {xdir} job={job_id} ops={op_idx} bytes={num_transfer_bytes} mode={mode}")
-                plan = (
+                plan = splan if mode == "stage" else (
                     _pitched_plan(all_src[:op_idx], all_dst[:op_idx], all_sizes[:op_idx], num_dst_blocks)
-                    if (_PITCHED or mode in ("stage", "strata")) and not self.gpu_to_cpu and not _COALESCE
+                    if (_PITCHED or mode == "strata") and not self.gpu_to_cpu and not _COALESCE
                     and fn is self._swap_blocks_batch
                     else None
                 )
@@ -1271,19 +1427,40 @@ class SingleDirectionOffloadingHandler:
                         and _strata_load_packed(all_src[:op_idx], all_dst[:op_idx], all_sizes[:op_idx], stream,
                                                 self._strata_bq, self._strata_nw, strata_keep)):
                     pitched_path = "strata_pf:%d:%d" % (self._strata_bq, self._strata_nw)   # 135: BLHNC
-                elif mode == "stage" and plan is not None and plan[2] == plan[1] and self._stage_blocks > 0:
+                elif mode == "stage" and stage_ok:
                     row = plan[0] * plan[1]
                     if self._stage_buf is None or self._stage_buf.numel() < 2 * self._stage_blocks * row:
+                        if self._sq_used:
+                            # staged SRPT halves may still use the old buffer: submit them all and let them finish
+                            with self._lock:
+                                self._pump_stage(force=True)
+                            torch.cuda.synchronize()
                         self._stage_buf = torch.empty(2 * self._stage_blocks * row, dtype=torch.uint8,
                                                       device=self.dst_tensors[0].device)
                     if self._stage_stream is None:
                         self._stage_stream = torch.cuda.Stream(device=self.dst_tensors[0].device)
                     stage_keep = []
-                    n_half, n_dma = _staged_load(all_src, dst, op_idx, num_dst_blocks, plan, stream,
-                                                 self._stage_stream, end_event, self._stage_buf,
-                                                 self._stage_blocks, self._stage_P, self._stage_W,
-                                                 self._stage_J, stage_keep)
-                    pitched_path = "stage:%d:%d" % (n_half, n_dma)
+                    if stage_srpt:
+                        # E2: upload the destination table on the transfer stream and queue the job; the halves are
+                        # submitted by _pump_stage (here once below, then the background thread)
+                        dst_tab = torch.empty(op_idx, dtype=torch.int64, device=self._stage_buf.device)
+                        dst_tab.copy_(dst[:op_idx].view(torch.int64), non_blocking=True)
+                        dst_tab.record_stream(self._stage_stream)
+                        ready = torch.Event()
+                        ready.record(stream)
+                        stage_keep.append(dst_tab)
+                        stage_job = _StageJob(
+                            rows=np.ascontiguousarray(all_src[:num_dst_blocks]).astype(np.int64), dst_tab=dst_tab,
+                            n_blocks=num_dst_blocks, plan=plan, B=self._stage_blocks, P=self._stage_P,
+                            W=self._stage_W, J=self._stage_J, ready=ready, end_event=end_event, keep=stage_keep)
+                        pitched_path = "stage:srpt"
+                    else:
+                        n_half, n_dma = _staged_load(all_src, dst, op_idx, num_dst_blocks, plan, stream,
+                                                     self._stage_stream, end_event, self._stage_buf,
+                                                     self._stage_blocks, self._stage_P, self._stage_W,
+                                                     self._stage_J, stage_keep)
+                        pitched_path = "stage:%d:%d" % (n_half, n_dma)
+                        self._sq.fence(end_event)   # its scatters hold both slots until its end event
                 elif plan is not None and _PITCHED:
                     _pitched_copies(src, dst, plan, num_dst_blocks, stream)
                     pitched_path = "pitched2d:%d" % num_dst_blocks
@@ -1319,7 +1496,8 @@ class SingleDirectionOffloadingHandler:
                 pitched=qplan,
                 pb_n=num_dst_blocks if qplan is not None else 0,
                 next_op=0,
-                submitted=not paced and not (lw_async and layer_groups),
+                submitted=not paced and not (lw_async and layer_groups) and stage_job is None,
+                stage_job=stage_job,
                 is_src_access_order_any=is_src_access_order_any,
                 t_submit=t_call,
                 t_ret=t_ret,
@@ -1339,11 +1517,29 @@ class SingleDirectionOffloadingHandler:
         try:
             if paced:
                 self._pump()
+            if stage_job is not None:
+                stage_job.transfer = self._transfers[-1]
+                self._sq.add(stage_job, self._stage_buf, self._stage_stream)
+                self._sq_used = True
+                self._start_bg()
+                self._pump_stage()
         finally:
             self._lock.release()
 
         # success
         return True
+
+    def _pump_stage(self, force: bool = False) -> None:
+        """E2: submit queued staged SRPT halves (callers hold self._lock). A transfer turns submitted only after its
+        job's last half and end event; with force every queued half is submitted now (ordered on the GPU by events)."""
+        if self._sq.pending():
+            self._sq.pump(self._stage_buf, self._stage_stream, force)
+        for t in self._transfers:
+            j = t.stage_job
+            if j is not None and j.submitted and not t.submitted:
+                t.path = "stage:%d:%d:s" % (j.n_halves, j.copies)
+                t.pump_max_ms, t.pump_sum_ms = j.host_max_ms, j.host_sum_ms
+                t.submitted = True
 
     def _start_bg(self) -> None:
         if self._bg is not None:
@@ -1364,6 +1560,9 @@ class SingleDirectionOffloadingHandler:
                     if LAYERWISE_ASYNC:
                         with self._lock:
                             self._pump_layers()
+                    if self._sq.pending():   # E2 staged SRPT halves, whatever the control says now
+                        with self._lock:
+                            self._pump_stage()
                 early = not self.gpu_to_cpu and "e" in _io_flags.flags()
                 if self._xfer_log is not None or early:
                     with self._lock:
@@ -1479,9 +1678,15 @@ class SingleDirectionOffloadingHandler:
                     self._start_bg()
                 return "queue", cap
             if raw.startswith(("ctrlstage:", "stage:")):
-                # "ctrlstage:<B>:<P>[:<W>:<J>]" staged load + SM control path (ctrl_uva sees the "ctrl" prefix);
-                # "stage:..." the same without the SM control path
-                parts = [int(x) for x in raw.split(":")[1:]]
+                # "ctrlstage:<B>:<P>[:<W>:<J>][:<flags>]" staged load + SM control path (ctrl_uva sees the "ctrl"
+                # prefix); "stage:..." the same without the SM control path. A non-numeric last field is flags:
+                # "s" = shortest remaining restore first between staged restores (E2, _StageQueue)
+                fields = raw.split(":")[1:]
+                flags = fields.pop() if fields and not fields[-1].isdigit() else ""
+                parts = [int(x) for x in fields]
+                self._stage_srpt = "s" in flags
+                if self._stage_srpt and not self.gpu_to_cpu:
+                    self._start_bg()
                 self._stage_blocks = parts[0]
                 self._stage_P = parts[1] if len(parts) > 1 else 16
                 self._stage_W = parts[2] if len(parts) > 2 else 4
@@ -1555,7 +1760,7 @@ class SingleDirectionOffloadingHandler:
             self._evq_inflight.popleft()
         if len(self._evq_inflight) >= 2:
             return
-        pending = next((t for t in self._transfers if not t.submitted), None)
+        pending = next((t for t in self._transfers if not t.submitted and t.stage_job is None), None)
         if pending is None:
             return
         if pending.pitched is not None:   # left over from a "p" queue control: finish it in blocks
@@ -1614,7 +1819,7 @@ class SingleDirectionOffloadingHandler:
             return
         pending = next(
             (t for t in self._transfers
-             if not t.submitted and (force or t.layer_groups is None)),
+             if not t.submitted and t.stage_job is None and (force or t.layer_groups is None)),
             None,
         )
         while pending is not None:
@@ -1635,7 +1840,7 @@ class SingleDirectionOffloadingHandler:
                     pending.end_event.record(pending.stream)
                     pending.submitted = True
                     self._pace_last_event = pending.end_event
-                pending = next((t for t in self._transfers if not t.submitted), None)
+                pending = next((t for t in self._transfers if not t.submitted and t.stage_job is None), None)
                 continue
             if pending.layer_groups is not None:
                 # forced drain of a layer-wise load: submit what is left at once
@@ -1681,7 +1886,7 @@ class SingleDirectionOffloadingHandler:
                     self._pace_last_event = ev
             if not force:
                 return
-            pending = next((t for t in self._transfers if not t.submitted), None)
+            pending = next((t for t in self._transfers if not t.submitted and t.stage_job is None), None)
 
     def _pump_queue(self) -> None:
         while self._q_chunks and self._q_chunks[0][0].query():
@@ -1689,10 +1894,10 @@ class SingleDirectionOffloadingHandler:
         in_flight = sum(n for _, n in self._q_chunks)
         while True:
             if self._q_srpt:
-                cands = [t for t in self._transfers if not t.submitted]
+                cands = [t for t in self._transfers if not t.submitted and t.stage_job is None]
                 pending = min(cands, key=lambda t: t.num_ops - t.next_op) if cands else None
             else:
-                pending = next((t for t in self._transfers if not t.submitted), None)
+                pending = next((t for t in self._transfers if not t.submitted and t.stage_job is None), None)
             if pending is None:
                 return
             plan = pending.pitched
@@ -1754,6 +1959,8 @@ class SingleDirectionOffloadingHandler:
         if not self.gpu_to_cpu:
             self._observe_step()
             self._pump()
+            if self._sq.pending():   # E2: once per engine step as well as from the background thread
+                self._pump_stage()
         if self._xfer_log is not None and not self.gpu_to_cpu:
             now = time.time()
             if self._xfer_last_call is not None and now - self._xfer_last_call > 0.1:
@@ -1775,7 +1982,10 @@ class SingleDirectionOffloadingHandler:
                 t = time.time()
                 ev.record(self._gpu_ref_stream)
                 self._gpu_ref_next = (ev, t)
-        if not self.gpu_to_cpu and self._mode()[0] == "queue" and self._q_srpt:
+        if not self.gpu_to_cpu and (
+            (self._mode()[0] == "queue" and self._q_srpt) or any(t.stage_job is not None for t in self._transfers)
+        ):
+            # out of order: SRPT finishes short loads first (a FIFO load still waits on the one before it on the GPU)
             done = [t for t in self._transfers if t.submitted and t.end_event.query()]
             if done:
                 self._transfers = deque(
@@ -1824,13 +2034,14 @@ class SingleDirectionOffloadingHandler:
                     '"t_ret":%.6f,"g_start":%.6f,"g_end":%.6f,"t_detect":%.6f,"pid":%d,'
                     '"wait_unsubmitted":%d,"wait_drains":%d,"q_inflight_max":%d,'
                     '"verify_n":%d,"verify_bad":%d,"evq_hook":%d,"evq_fallback":%d,"ops_raw":%d,'
-                    '"pump_max_ms":%.3f,"pump_sum_ms":%.3f}\n'
+                    '"pump_max_ms":%.3f,"pump_sum_ms":%.3f,"stage_fallback":%d}\n'
                     % (self._xfer_dir, transfer.job_id, transfer.num_bytes,
                        transfer.num_ops, transfer.path or self._mode()[0], transfer.t_submit,
                        transfer.t_ret, g_start, g_end, time.time(),
                        os.getpid(), self._wait_unsubmitted, self._wait_drains,
                        self._q_inflight_max, *self._verify_last, transfer.evq_hook, transfer.evq_fallback,
-                       transfer.ops_raw or transfer.num_ops, transfer.pump_max_ms, transfer.pump_sum_ms)
+                       transfer.ops_raw or transfer.num_ops, transfer.pump_max_ms, transfer.pump_sum_ms,
+                       self._sq_fallback)
                 )
             if self._xfer_log is not None:
                 self._xfer_log.write(
@@ -1862,9 +2073,12 @@ class SingleDirectionOffloadingHandler:
             needed = [t for t in self._transfers if not t.submitted and t.job_id in job_ids]
             if needed:
                 self._wait_drains += 1
-                if self._mode()[0] == "queue":
+                if any(t.stage_job is not None for t in needed):
+                    self._pump_stage(force=True)   # E2: the end events are recorded only by the last half
+                needed = [t for t in needed if not t.submitted]
+                if needed and self._mode()[0] == "queue":
                     self._drain_queue_bounded(needed)
-                else:
+                elif needed:
                     self._pump(force=True)
         for job_id in job_ids:
             event = self._transfer_events.get(job_id)
@@ -1886,6 +2100,8 @@ class SingleDirectionOffloadingHandler:
         if self._ipc is not None:
             self._ipc.close()
         with self._lock:
+            if self._sq.pending():
+                self._pump_stage(force=True)
             if any(not t.submitted for t in self._transfers):
                 self._pump(force=True)
         sync_error: Exception | None = None
