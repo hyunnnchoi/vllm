@@ -189,7 +189,7 @@ def _copy_(self, src, non_blocking=False, *args, **kwargs):
     # compilation call the ATen op instead (eager behaviour unchanged). The fp8 KV path's query quant
     # calls scale.to(torch.float32) in the compiled forward (136 E5).
     if torch.compiler.is_compiling():
-        return torch.ops.aten.copy_(self, src, non_blocking)
+        return torch.ops.aten.copy_.default(self, src, non_blocking)
     if (
         non_blocking
         and not args
@@ -218,9 +218,32 @@ def _copy_(self, src, non_blocking=False, *args, **kwargs):
     return _orig_copy(self, src, non_blocking, *args, **kwargs)
 
 
+def _to_aten(self, *args, **kwargs):
+    """Tensor.to under compilation through an explicit ATen overload: vLLM's IR passes look up an overload, and the
+    aten.to packet has no default one (136 E5 retry)."""
+    if args and isinstance(args[0], torch.Tensor):
+        nb = args[1] if len(args) > 1 else kwargs.get("non_blocking", False)
+        cp = args[2] if len(args) > 2 else kwargs.get("copy", False)
+        return torch.ops.aten.to.other(self, args[0], nb, cp, kwargs.get("memory_format"))
+    dtype, device, rest = kwargs.get("dtype"), kwargs.get("device"), []
+    for a in args:
+        if isinstance(a, torch.dtype):
+            dtype = a
+        elif isinstance(a, (str, torch.device)) or (isinstance(a, int) and not isinstance(a, bool)):
+            device = a
+        else:
+            rest.append(a)
+    nb = rest[0] if rest else kwargs.get("non_blocking", False)
+    cp = rest[1] if len(rest) > 1 else kwargs.get("copy", False)
+    mf = kwargs.get("memory_format")
+    if device is None and dtype is not None:
+        return torch.ops.aten.to.dtype(self, dtype, nb, cp, mf)
+    return torch.ops.aten.to.dtype_layout(self, dtype=dtype, device=device, non_blocking=nb, copy=cp, memory_format=mf)
+
+
 def _to(self, *args, **kwargs):
     if torch.compiler.is_compiling():
-        return torch.ops.aten.to(self, *args, **kwargs)
+        return _to_aten(self, *args, **kwargs)
     if (
         kwargs.get("non_blocking")
         and set(kwargs) <= {"non_blocking", "device", "dtype"}
