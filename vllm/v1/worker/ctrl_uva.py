@@ -185,6 +185,11 @@ def _launch(dst: torch.Tensor, src: torch.Tensor) -> None:
 
 
 def _copy_(self, src, non_blocking=False, *args, **kwargs):
+    # Dynamo inlines this patch inside compiled model code but cannot trace the saved C method; under
+    # compilation call the ATen op instead (eager behaviour unchanged). The fp8 KV path's query quant
+    # calls scale.to(torch.float32) in the compiled forward (136 E5).
+    if torch.compiler.is_compiling():
+        return torch.ops.aten.copy_(self, src, non_blocking)
     if (
         non_blocking
         and not args
@@ -214,6 +219,8 @@ def _copy_(self, src, non_blocking=False, *args, **kwargs):
 
 
 def _to(self, *args, **kwargs):
+    if torch.compiler.is_compiling():
+        return torch.ops.aten.to(self, *args, **kwargs)
     if (
         kwargs.get("non_blocking")
         and set(kwargs) <= {"non_blocking", "device", "dtype"}
