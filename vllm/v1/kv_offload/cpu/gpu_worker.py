@@ -866,6 +866,9 @@ class SingleDirectionOffloadingHandler:
         # E2: "s" flag on ctrlstage = SRPT between staged restores (_StageQueue); fallback = loads in that mode that
         # could not be staged (submitted after every queued staged half, logged per transfer)
         self._stage_srpt = False
+        # 137 K1: "h" flag on ctrlstage = the scatter stream gets the highest priority (with P = 2 per SM, the
+        # engine-free bundle's "burst" variant)
+        self._stage_hp = False
         self._sq = _StageQueue()
         self._sq_used = False
         self._sq_fallback = 0
@@ -1449,8 +1452,12 @@ class SingleDirectionOffloadingHandler:
                             torch.cuda.synchronize()
                         self._stage_buf = torch.empty(2 * self._stage_blocks * row, dtype=torch.uint8,
                                                       device=self.dst_tensors[0].device)
+                    prio = -1 if self._stage_hp else 0
+                    if self._stage_stream is not None and self._stage_stream.priority != prio and not self._sq_used:
+                        self._stage_stream.synchronize()   # the control changed: the old stream's scatters finish
+                        self._stage_stream = None
                     if self._stage_stream is None:
-                        self._stage_stream = torch.cuda.Stream(device=self.dst_tensors[0].device)
+                        self._stage_stream = torch.cuda.Stream(device=self.dst_tensors[0].device, priority=prio)
                     stage_keep = []
                     if stage_srpt:
                         # E2: upload the destination table on the transfer stream and queue the job; the halves are
@@ -1698,6 +1705,7 @@ class SingleDirectionOffloadingHandler:
                 flags = fields.pop() if fields and not fields[-1].isdigit() else ""
                 parts = [int(x) for x in fields]
                 self._stage_srpt = "s" in flags
+                self._stage_hp = "h" in flags
                 if self._stage_srpt and not self.gpu_to_cpu:
                     self._start_bg()
                 self._stage_blocks = parts[0]
