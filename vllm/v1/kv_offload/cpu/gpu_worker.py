@@ -548,6 +548,10 @@ class _StageJob:
     host_max_ms: float = 0.0      # host time of the half submissions (largest, total)
     host_sum_ms: float = 0.0
     transfer: object = None
+    t_create: float = 0.0         # VLLM_KV_SQ_DEBUG: host times (create, ready first seen, first half) and the stream
+    t_ready_seen: float = 0.0     # the transfer stream waited on (cuda_stream handle, 0 = legacy default stream)
+    t_first: float = 0.0
+    cur_stream: int = -1
 
 
 class _StageQueue:
@@ -594,7 +598,14 @@ class _StageQueue:
             # a job joins once its destination table and compute barrier are done (ready), so that a new job's wait
             # never holds up the DMA stream that the running job's halves share (with force every job joins: the
             # DMA stream then waits on the GPU)
-            cands = [j for j in self.jobs if force or j.next > 0 or j.ready.query()]
+            cands = []
+            for j in self.jobs:
+                if force or j.next > 0:
+                    cands.append(j)
+                elif j.ready.query():
+                    if j.t_ready_seen == 0.0:
+                        j.t_ready_seen = time.time()
+                    cands.append(j)
             if not cands:
                 break
             job = min(cands, key=lambda j: (j.n_halves - j.next, j.seq))
@@ -623,6 +634,7 @@ class _StageQueue:
         job.keep.extend((st, dt_, zt))
         ds = self.dma_stream
         if j == 0:
+            job.t_first = time.time()
             ds.wait_event(job.ready)
         if self.slot_free[h] is not None:
             ds.wait_event(self.slot_free[h])   # this slot's last scatter (or a fence)
@@ -886,6 +898,11 @@ class SingleDirectionOffloadingHandler:
         # gap of > 100 ms between get_finished() calls of the load handler
         # (an engine step that took that long), to line up client-side
         # inter-token gaps with KV loads.
+        # 138 batch 113 (A100 debug): VLLM_KV_SQ_DEBUG=<path> logs every staged SRPT job when it finishes: host times of
+        # its creation, of the first pump that saw its ready event (table upload and compute barrier done), of its first
+        # half; GPU time from the transfer's start event to ready; the stream the transfer stream waited on.
+        sq_dbg = os.environ.get("VLLM_KV_SQ_DEBUG")
+        self._sq_dbg = open(sq_dbg, "a", buffering=1) if sq_dbg else None
         xfer_log = os.environ.get("VLLM_KV_XFER_LOG")
         self._xfer_log = open(xfer_log, "a", buffering=1) if xfer_log else None
         # VLLM_KV_GPU_LOG (optional, no extra thread): one JSON line per finished
@@ -1292,8 +1309,9 @@ class SingleDirectionOffloadingHandler:
             src, dst, sizes = batch_src[:op_idx], batch_dst[:op_idx], batch_sizes[:op_idx]
             all_src, all_dst, all_sizes = src.numpy(), dst.numpy(), sizes.numpy()
             all_src[:], all_dst[:], all_sizes[:] = pieces
+        cur_stream = current_platform.current_stream()
         if self.gpu_to_cpu or "w" not in _io_flags.flags():
-            stream.wait_stream(current_platform.current_stream())
+            stream.wait_stream(cur_stream)
         # E2: decide here whether this load is a staged SRPT job. Any other load that comes while staged SRPT work
         # exists (a fallback in that mode, or any load after the control changed) is ordered after every staged half:
         # the queued staged jobs are submitted first (so no end event is waited on before it is recorded), and the
@@ -1465,13 +1483,14 @@ class SingleDirectionOffloadingHandler:
                         dst_tab = torch.empty(op_idx, dtype=torch.int64, device=self._stage_buf.device)
                         dst_tab.copy_(dst[:op_idx].view(torch.int64), non_blocking=True)
                         dst_tab.record_stream(self._stage_stream)
-                        ready = torch.Event()
+                        ready = torch.Event(enable_timing=self._sq_dbg is not None)
                         ready.record(stream)
                         stage_keep.append(dst_tab)
                         stage_job = _StageJob(
                             rows=np.ascontiguousarray(all_src[:num_dst_blocks]).astype(np.int64), dst_tab=dst_tab,
                             n_blocks=num_dst_blocks, plan=plan, B=self._stage_blocks, P=self._stage_P,
-                            W=self._stage_W, J=self._stage_J, ready=ready, end_event=end_event, keep=stage_keep)
+                            W=self._stage_W, J=self._stage_J, ready=ready, end_event=end_event, keep=stage_keep,
+                            t_create=time.time(), cur_stream=int(cur_stream.cuda_stream))
                         pitched_path = "stage:srpt"
                     else:
                         n_half, n_dma = _staged_load(all_src, dst, op_idx, num_dst_blocks, plan, stream,
@@ -2064,6 +2083,17 @@ class SingleDirectionOffloadingHandler:
                        transfer.ops_raw or transfer.num_ops, transfer.pump_max_ms, transfer.pump_sum_ms,
                        self._sq_fallback)
                 )
+            j = transfer.stage_job
+            if self._sq_dbg is not None and j is not None:
+                try:
+                    g_ready_ms = transfer.start_event.elapsed_time(j.ready)
+                except Exception:
+                    g_ready_ms = -1.0
+                self._sq_dbg.write(json.dumps(dict(
+                    job=transfer.job_id, blocks=j.n_blocks, halves=j.n_halves, t_create=j.t_create,
+                    t_ready_seen=j.t_ready_seen, t_first=j.t_first, t_detect=time.time(), cur_stream=j.cur_stream,
+                    g_start_to_ready_ms=g_ready_ms, g_start_to_end_ms=transfer.start_event.elapsed_time(transfer.end_event)))
+                    + "\n")
             if self._xfer_log is not None:
                 self._xfer_log.write(
                     '{"ev":"xfer","dir":"%s","job":%d,"bytes":%d,"ops":%d,'
