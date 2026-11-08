@@ -854,6 +854,10 @@ class SingleDirectionOffloadingHandler:
         # "p" queue flag (130): loads that _pitched_plan accepts go as pitched 2D copies (one per block) in
         # chunks of <chunk> // layers blocks, at most <cap> descriptor equivalents in flight.
         self._q_pitched = False
+        # "o" queue flag (137 K2): loads that _pitched_plan accepts keep their copies but go block by block (all
+        # layers of one block, then the next), so the host reads each CPU row in order instead of jumping a row per
+        # copy. The transfer path is logged as "blockq:<blocks>".
+        self._q_order = False
         # staged load (132): rows per staging half, scatter kernel programs / warps / jobs per step, buffers
         self._stage_blocks, self._stage_P, self._stage_W, self._stage_J = 0, 16, 4, 4
         self._stage_buf: torch.Tensor | None = None
@@ -1380,6 +1384,14 @@ class SingleDirectionOffloadingHandler:
         )
         if qplan is not None:
             pitched_path = "pitched2d:%d:q" % num_dst_blocks
+        elif (paced and mode == "queue" and self._q_order and split == 1 and not self.gpu_to_cpu
+                and not _COALESCE):
+            oplan = _pitched_plan(all_src[:op_idx], all_dst[:op_idx], all_sizes[:op_idx], num_dst_blocks)
+            if oplan is not None:
+                perm = np.arange(op_idx).reshape(oplan[0], num_dst_blocks).T.ravel()
+                for arr in (all_src, all_dst, all_sizes):
+                    arr[:op_idx] = arr[:op_idx][perm]
+                pitched_path = "blockq:%d" % num_dst_blocks
         with current_platform.stream(stream):
             start_event.record(stream)
             if lw_async:
@@ -1660,7 +1672,7 @@ class SingleDirectionOffloadingHandler:
             if self._auto_on:
                 self._q_cap, self._q_chunk = 16384, 4096
                 self._q_dma, self._q_route, self._q_thread, self._q_srpt = True, False, False, True
-                self._q_pitched = False
+                self._q_pitched = self._q_order = False
                 return "queue", self._q_cap
             if raw.startswith("ctrlq:"):
                 parts = raw[6:].split(":")
@@ -1674,6 +1686,7 @@ class SingleDirectionOffloadingHandler:
                 self._q_thread = "t" in flags
                 self._q_srpt = "s" in flags
                 self._q_pitched = "p" in flags
+                self._q_order = "o" in flags
                 if (self._q_thread or "e" in flags) and not self.gpu_to_cpu:
                     self._start_bg()
                 return "queue", cap
