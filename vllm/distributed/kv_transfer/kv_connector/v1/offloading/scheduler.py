@@ -32,6 +32,7 @@ from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
+from vllm.v1.engine import loop_log as _loop_log
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
@@ -1206,6 +1207,15 @@ class OffloadingConnectorScheduler:
             src_spec=src_spec,
             dst_spec=dst_spec,
         )
+        if _loop_log.enabled():
+            _loop_log.log(
+                "adm",
+                time.time(),
+                sid=_loop_log.SID,
+                job=load_job_id,
+                req=request.request_id,
+                blk=len(dst_block_ids),
+            )
         # a load can only be issued when no other jobs are pending.
         assert not req_status.transfer_jobs
         req_status.transfer_jobs.add(load_job_id)

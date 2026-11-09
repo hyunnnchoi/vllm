@@ -598,7 +598,21 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        if loop_log.enabled():
+            _sid = loop_log.next_sid()
+            _t0 = time.time()
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        if loop_log.enabled():
+            scheduler_output._aris_sid = _sid
+            loop_log.log(
+                "sched",
+                _t0,
+                time.time(),
+                sid=_sid,
+                tok=scheduler_output.total_num_scheduled_tokens,
+                new=len(scheduler_output.scheduled_new_reqs),
+                **loop_log.sched_fields(scheduler_output),
+            )
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -620,12 +634,15 @@ class EngineCore:
         )
         if loop_log.enabled():
             outs = [o for eco in engine_core_outputs.values() for o in eco.outputs]
+            fin_ids = [o.request_id for o in outs if o.finish_reason is not None]
             loop_log.log(
                 "upd",
                 _t0,
                 time.time(),
+                sid=getattr(scheduler_output, "_aris_sid", -1),
                 n=len(outs),
-                fin=sum(o.finish_reason is not None for o in outs),
+                fin=len(fin_ids),
+                **({"fin_ids": fin_ids} if fin_ids else {}),
             )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
@@ -669,6 +686,7 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             _t0 = time.time()
+            _sid = loop_log.next_sid() if loop_log.enabled() else -1
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
             _t1 = time.time()
             with self.log_error_detail(scheduler_output):
@@ -676,13 +694,16 @@ class EngineCore:
                     scheduler_output, non_block=True
                 )
             if loop_log.enabled():
+                scheduler_output._aris_sid = _sid
                 loop_log.log(
                     "sched",
                     _t0,
                     time.time(),
                     t_sched=_t1,
+                    sid=_sid,
                     tok=scheduler_output.total_num_scheduled_tokens,
                     new=len(scheduler_output.scheduled_new_reqs),
+                    **loop_log.sched_fields(scheduler_output),
                 )
             if self.is_ec_consumer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
@@ -745,12 +766,15 @@ class EngineCore:
         )
         if loop_log.enabled():
             outs = [o for eco in engine_core_outputs.values() for o in eco.outputs]
+            fin_ids = [o.request_id for o in outs if o.finish_reason is not None]
             loop_log.log(
                 "upd",
                 _t0,
                 time.time(),
+                sid=getattr(scheduler_output, "_aris_sid", -1),
                 n=len(outs),
-                fin=sum(o.finish_reason is not None for o in outs),
+                fin=len(fin_ids),
+                **({"fin_ids": fin_ids} if fin_ids else {}),
             )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
