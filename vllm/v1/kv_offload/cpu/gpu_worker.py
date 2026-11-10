@@ -1441,6 +1441,8 @@ class SingleDirectionOffloadingHandler:
                                                 torch.cuda.current_device())
                 self._event_pool.append(end_event)   # replaced by the interprocess event below
                 end_event = self._ipc.submit(job_id, all_src[:op_idx], all_dst[:op_idx], all_sizes[:op_idx], stream)
+            elif mode == "ideal" and not self.gpu_to_cpu and op_idx > 0:
+                pitched_path = "ideal"   # aris 209: no copy; the end event recorded below marks the load done
             elif op_idx > 0 and not paced:
                 if _nvtx.ON:
                     torch.cuda.nvtx.range_push(
@@ -1745,6 +1747,12 @@ class SingleDirectionOffloadingHandler:
                 return "dma", 0
             if raw == "ipc":
                 return "ipc", 0
+            if raw == "ideal":
+                # aris 209 ("GPU hit (ideal)" path): a CPU->GPU load copies nothing and is reported done at its end
+                # event, as if the restored prefix had already been in GPU memory. Block allocation, prefix-cache
+                # entries and stores (GPU->CPU) are unchanged; the restored blocks keep stale KV, so the outputs differ
+                # (timing runs only, byte check off). Step-critical copies stay on vLLM's default path (no "ctrl").
+                return "ideal", 0
             if raw.startswith("evq:"):
                 self._evq_n = int(raw[4:])
                 return "evq", self._evq_n
@@ -1768,7 +1776,7 @@ class SingleDirectionOffloadingHandler:
 
     def _pacing_setting(self) -> int:
         mode, _ = self._mode()
-        return 0 if mode in ("stock", "dma", "triton", "tritonx", "tritongc", "stage", "strata") else 1
+        return 0 if mode in ("stock", "dma", "triton", "tritonx", "tritongc", "stage", "strata", "ideal") else 1
 
     def pump_at_inputs(self) -> None:
         """Called right before the forward, after the step's input copies."""
