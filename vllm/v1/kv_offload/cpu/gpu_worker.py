@@ -75,6 +75,9 @@ LAYERWISE = os.environ.get("VLLM_KV_OFFLOAD_LAYERWISE", "0") == "1"
 REF_LAYER_NAMES: list[list[str]] = []
 # layer name -> events of this step's layer-wise loads (consumed by wait_for_layer_load)
 LAYER_EVENTS: dict[str, list] = {}
+# aris experiment 209 run3: CPU->GPU load jobs to complete without a copy (requests sent with kv_transfer_params
+# {"aris_free_load": true}, i.e. calls the run treats as GPU hits); filled by the offloading worker before submit_load
+FREE_LOAD_JOBS: set[int] = set()
 
 # aris Baton-style layer-wise offload (VLLM_KV_OFFLOAD_LAYERWISE=2), after the layer-wise
 # H2D of /home/work/yhgo/baton-incremental-v023 (load path only; no LAS scheduler, no
@@ -1297,7 +1300,10 @@ class SingleDirectionOffloadingHandler:
         # earlier step for a since-reallocated block; with async scheduling
         # nothing else orders that zeroing against this copy.
         mode, val = self._mode() if not self.gpu_to_cpu else ("stock", 0)
-        split = getattr(self, "_split", 1) if not self.gpu_to_cpu else 1
+        if not self.gpu_to_cpu and job_id in FREE_LOAD_JOBS:
+            FREE_LOAD_JOBS.discard(job_id)
+            mode, val = "free", 0   # aris 209 run3: this request is a GPU hit by the run's rule; no copy
+        split = getattr(self, "_split", 1) if not self.gpu_to_cpu and mode != "free" else 1
         if split > 1 and op_idx > 0 and not layerwise:
             pieces = _split_descriptors(all_src[:op_idx], all_dst[:op_idx], all_sizes[:op_idx], split)
             need = op_idx * split
@@ -1441,8 +1447,8 @@ class SingleDirectionOffloadingHandler:
                                                 torch.cuda.current_device())
                 self._event_pool.append(end_event)   # replaced by the interprocess event below
                 end_event = self._ipc.submit(job_id, all_src[:op_idx], all_dst[:op_idx], all_sizes[:op_idx], stream)
-            elif mode == "ideal" and not self.gpu_to_cpu and op_idx > 0:
-                pitched_path = "ideal"   # aris 209: no copy; the end event recorded below marks the load done
+            elif mode in ("ideal", "free") and not self.gpu_to_cpu and op_idx > 0:
+                pitched_path = mode   # aris 209: no copy; the end event recorded below marks the load done
             elif op_idx > 0 and not paced:
                 if _nvtx.ON:
                     torch.cuda.nvtx.range_push(

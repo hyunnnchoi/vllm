@@ -73,6 +73,9 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
     # aris Baton-style layer-wise: pending load jobs of the requests computed in this
     # step; their forward waits per layer for these loads
     compute_jobs: set[int] | None = None
+    # aris experiment 209 run3: load jobs of requests with kv_transfer_params {"aris_free_load": true}; the worker
+    # completes them without a copy (as the "ideal" control does for every load)
+    free_load_jobs: set[int] | None = None
 
 
 @dataclass

@@ -323,6 +323,8 @@ class OffloadingConnectorWorker:
                     % (job_id, entry.req_id, time.time())
                 )
             assert isinstance(entry.dst_spec, GPULoadStoreSpec)
+            if metadata.free_load_jobs and job_id in metadata.free_load_jobs:
+                _cpu_gw.FREE_LOAD_JOBS.add(job_id)   # aris 209 run3: completed without a copy
             success = self.worker.submit_load(job_id, entry.src_spec, entry.dst_spec)
             assert success
 

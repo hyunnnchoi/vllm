@@ -588,6 +588,8 @@ class OffloadingConnectorScheduler:
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
+        # aris experiment 209 run3: load jobs to complete without a copy (aris_free_load requests)
+        self._current_batch_free_jobs: set[int] = set()
         self._current_batch_jobs_to_flush: set[int] = set()
         # GPU block IDs allocated in the current engine step
         self._current_batch_allocated_block_ids: set[int] = set()
@@ -1207,6 +1209,8 @@ class OffloadingConnectorScheduler:
             src_spec=src_spec,
             dst_spec=dst_spec,
         )
+        if (request.kv_transfer_params or {}).get("aris_free_load"):
+            self._current_batch_free_jobs.add(load_job_id)
         if _loop_log.enabled():
             _loop_log.log(
                 "adm",
@@ -1865,6 +1869,7 @@ class OffloadingConnectorScheduler:
             store_jobs=partial_store_jobs | normal_store_jobs,
             jobs_to_flush=self._current_batch_jobs_to_flush,
             compute_jobs=compute_jobs,
+            free_load_jobs=self._current_batch_free_jobs or None,
         )
 
         # All prepare_store calls for finished requests have been issued.
@@ -1882,6 +1887,7 @@ class OffloadingConnectorScheduler:
                 job.req_id for job in self._current_batch_load_jobs.values()
             ]
         self._current_batch_load_jobs = {}
+        self._current_batch_free_jobs = set()
         self._current_batch_jobs_to_flush = set()
         self._current_batch_allocated_block_ids = set()
         return meta
