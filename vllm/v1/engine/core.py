@@ -602,13 +602,14 @@ class EngineCore:
             _sid = loop_log.next_sid()
             _t0 = time.time()
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-        if loop_log.enabled():
+        if loop_log.enabled() and loop_log.keep(scheduler_output):
             scheduler_output._aris_sid = _sid
             loop_log.log(
                 "sched",
                 _t0,
                 time.time(),
                 sid=_sid,
+                fsid=loop_log.fsid(self.scheduler),
                 tok=scheduler_output.total_num_scheduled_tokens,
                 new=len(scheduler_output.scheduled_new_reqs),
                 **loop_log.sched_fields(scheduler_output),
@@ -621,7 +622,8 @@ class EngineCore:
         ):
             _t0 = time.time()
             model_output = future.result()
-            loop_log.log("wait", _t0, time.time())
+            if loop_log.keep(scheduler_output):
+                loop_log.log("wait", _t0, time.time())
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
 
@@ -632,7 +634,7 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
-        if loop_log.enabled():
+        if loop_log.enabled() and loop_log.keep(scheduler_output):
             outs = [o for eco in engine_core_outputs.values() for o in eco.outputs]
             fin_ids = [o.request_id for o in outs if o.finish_reason is not None]
             loop_log.log(
@@ -643,6 +645,7 @@ class EngineCore:
                 n=len(outs),
                 fin=len(fin_ids),
                 **({"fin_ids": fin_ids} if fin_ids else {}),
+                **loop_log.upd_fields(scheduler_output, self.scheduler, outs),
             )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
@@ -693,7 +696,7 @@ class EngineCore:
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
-            if loop_log.enabled():
+            if loop_log.enabled() and loop_log.keep(scheduler_output):
                 scheduler_output._aris_sid = _sid
                 loop_log.log(
                     "sched",
@@ -701,6 +704,7 @@ class EngineCore:
                     time.time(),
                     t_sched=_t1,
                     sid=_sid,
+                    fsid=loop_log.fsid(self.scheduler),
                     tok=scheduler_output.total_num_scheduled_tokens,
                     new=len(scheduler_output.scheduled_new_reqs),
                     **loop_log.sched_fields(scheduler_output),
@@ -750,7 +754,8 @@ class EngineCore:
         ):
             _t0 = time.time()
             model_output = future.result()
-            loop_log.log("wait", _t0, time.time())
+            if loop_log.keep(scheduler_output):
+                loop_log.log("wait", _t0, time.time())
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
@@ -764,7 +769,7 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
-        if loop_log.enabled():
+        if loop_log.enabled() and loop_log.keep(scheduler_output):
             outs = [o for eco in engine_core_outputs.values() for o in eco.outputs]
             fin_ids = [o.request_id for o in outs if o.finish_reason is not None]
             loop_log.log(
@@ -775,6 +780,7 @@ class EngineCore:
                 n=len(outs),
                 fin=len(fin_ids),
                 **({"fin_ids": fin_ids} if fin_ids else {}),
+                **loop_log.upd_fields(scheduler_output, self.scheduler, outs),
             )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 

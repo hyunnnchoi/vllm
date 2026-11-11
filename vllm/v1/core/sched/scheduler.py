@@ -39,6 +39,7 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched.aris_plan import PlanState
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -329,6 +330,8 @@ class Scheduler(SchedulerInterface):
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
         self.current_step = 0
+        # aris experiment 212: schedule replay (forward-step count, held requests)
+        self._aris = PlanState()
         # DP prefill balancing: Flag to track whether the last cadence-aligned
         # prefill batch fully drained the waiting queue. Prefill throttling
         # is disabled in this case.
@@ -589,6 +592,10 @@ class Scheduler(SchedulerInterface):
         input_budget = self.scheduler_config.max_num_batched_tokens
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
+            token_budget = 0
+        # aris experiment 212: release due planned requests; variant A barrier
+        self._aris.release(self)
+        if self._aris.barrier(self):
             token_budget = 0
 
         # Encoder-related.
@@ -1268,6 +1275,7 @@ class Scheduler(SchedulerInterface):
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    self._aris.on_load(request)
                     step_skipped_waiting.prepend_request(request)
                     # Set num_computed_tokens even though KVs are not yet loaded.
                     # request.num_computed_tokens will not be used anywhere until
@@ -1511,6 +1519,8 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if total_num_scheduled_tokens > 0:
+            self._aris.fsid += 1
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -2542,7 +2552,8 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
-            self._enqueue_waiting_request(request)
+            if not self._aris.on_add(request):
+                self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.spec_decode_metrics_level != "none":
                 request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
@@ -2587,6 +2598,7 @@ class Scheduler(SchedulerInterface):
                 continue
 
             valid_requests.append(request)
+            self._aris.drop(request)
             if request.status == RequestStatus.RUNNING:
                 running_requests_to_remove.add(request)
             else:
@@ -2635,6 +2647,7 @@ class Scheduler(SchedulerInterface):
 
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
+        self._aris.on_finish(request)
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
@@ -2711,6 +2724,7 @@ class Scheduler(SchedulerInterface):
             len(self.waiting)
             + len(self.skipped_waiting)
             - self.num_waiting_for_streaming_input
+            + len(self._aris.held)
         )
         return num_waiting + len(self.running)
 
@@ -2841,7 +2855,7 @@ class Scheduler(SchedulerInterface):
         )
         return SchedulerStats(
             num_running_reqs=len(self.running),
-            num_waiting_reqs=len(self.waiting),
+            num_waiting_reqs=len(self.waiting) + len(self._aris.held),
             num_skipped_waiting_reqs=len(self.skipped_waiting),
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
@@ -3026,6 +3040,8 @@ class Scheduler(SchedulerInterface):
             # update_from_output(), based on worker-side connector signals
             # in KVConnectorOutput.finished_recving
             if request.request_id not in self.finished_recving_kv_req_ids:
+                return False
+            if not self._aris.join_ok(request):   # aris experiment 212 variant A
                 return False
             self._update_waiting_for_remote_kv(request)
             if request.num_preemptions:

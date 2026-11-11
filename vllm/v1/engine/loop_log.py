@@ -22,6 +22,11 @@ import os
 import threading
 
 _PATH = os.environ.get("VLLM_LOOP_LOG") or None
+# Experiment 212: in a schedule replay (VLLM_ARIS_PLAN_GO set) the engine spins on empty schedules while it holds requests,
+# so sched / wait / upd events of empty schedules are dropped; VLLM_ARIS_UPD_RIDS=1 adds the ids of the requests that got
+# tokens to each upd event (engine-side token times), and sched / upd carry fsid (the scheduler's forward-step count).
+QUIET = bool(os.environ.get("VLLM_ARIS_PLAN_GO"))
+RIDS = bool(os.environ.get("VLLM_ARIS_UPD_RIDS"))
 _lock = threading.Lock()
 _f = None
 SID = 0
@@ -35,6 +40,21 @@ def next_sid() -> int:
     global SID
     SID += 1
     return SID
+
+
+def keep(so) -> bool:
+    return not QUIET or so.total_num_scheduled_tokens > 0
+
+
+def fsid(scheduler):
+    return getattr(getattr(scheduler, "_aris", None), "fsid", None)
+
+
+def upd_fields(so, scheduler, outs) -> dict:
+    d = {"fsid": fsid(scheduler)}
+    if RIDS:
+        d["rids"] = [o.request_id for o in outs if o.new_token_ids]
+    return d
 
 
 def sched_fields(so) -> dict:
