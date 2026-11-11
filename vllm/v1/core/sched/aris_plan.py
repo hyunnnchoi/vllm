@@ -93,7 +93,7 @@ class PlanState:
             return
         if self.go_fsid is None:
             if GO is None or not os.path.exists(GO):
-                time.sleep(0.0005)
+                time.sleep(0.002)   # before go the engine only holds requests
                 return
             self.go_fsid = self.fsid
             loop_log.log("go", time.time(), fsid=self.fsid, held=len(self.held))
