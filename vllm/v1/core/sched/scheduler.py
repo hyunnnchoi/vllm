@@ -1275,7 +1275,7 @@ class Scheduler(SchedulerInterface):
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
-                    self._aris.on_load(request)
+                    self._aris.on_load(request, num_external_computed_tokens)
                     step_skipped_waiting.prepend_request(request)
                     # Set num_computed_tokens even though KVs are not yet loaded.
                     # request.num_computed_tokens will not be used anywhere until
@@ -3043,6 +3043,7 @@ class Scheduler(SchedulerInterface):
                 return False
             if not self._aris.join_ok(request):   # aris experiment 212 variant A
                 return False
+            self._aris.on_join(request)
             self._update_waiting_for_remote_kv(request)
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED

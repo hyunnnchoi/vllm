@@ -62,11 +62,17 @@ class PlanState:
             return True
         return False
 
-    def on_load(self, request) -> None:
+    def on_load(self, request, ext_tokens: int | None = None) -> None:
         request._aris_adm = self.fsid
         key = _params(request).get("aris_key")
         if key is not None:
             loop_log.log("pload", time.time(), key=key, fsid=self.fsid)
+        # experiment 213: every async load (any connector, e.g. LMCache MP) from the scheduler's view
+        loop_log.log("rload", time.time(), req=request.request_id, fsid=self.fsid, ext=ext_tokens)
+
+    def on_join(self, request) -> None:
+        """Experiment 213: the async load finished and the request may be scheduled."""
+        loop_log.log("rjoin", time.time(), req=request.request_id, fsid=self.fsid)
 
     def on_finish(self, request) -> None:
         key = _params(request).get("aris_key")
