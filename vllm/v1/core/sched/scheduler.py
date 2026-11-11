@@ -3041,7 +3041,7 @@ class Scheduler(SchedulerInterface):
             # in KVConnectorOutput.finished_recving
             if request.request_id not in self.finished_recving_kv_req_ids:
                 return False
-            if not self._aris.join_ok(request):   # aris experiment 212 variant A
+            if not self._aris.join_ok(request, self):   # aris experiment 212 variant A
                 return False
             self._aris.on_join(request)
             self._update_waiting_for_remote_kv(request)

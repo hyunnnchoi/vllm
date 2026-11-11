@@ -138,15 +138,20 @@ class PlanState:
             loop_log.log("rel", time.time(), key=_params(r)["aris_key"], fsid=self.fsid,
                          rel=rel)
 
-    def join_ok(self, request) -> bool:
-        """Variant A: may this loaded request leave WAITING_FOR_REMOTE_KVS now?"""
+    def join_ok(self, request, sched=None) -> bool:
+        """Variant A: may this loaded request leave WAITING_FOR_REMOTE_KVS now? Also when nothing runs: no forward step
+        can come before it joins (run 008 of 2026-11-11 waited for steps that only its join could start)."""
         pl = _params(request).get("aris_plan")
         if not pl or pl.get("join") is None:
+            return True
+        if sched is not None and not sched.running:
             return True
         return self.fsid >= getattr(request, "_aris_adm", 0) + int(pl["join"])
 
     def barrier(self, sched) -> bool:
-        """Variant A: a restored request is due to join but its load is not done."""
+        """Variant A: a restored request is due to join but its load is not done (only while others run)."""
+        if not sched.running:
+            return False
         for r in sched.skipped_waiting:
             pl = _params(r).get("aris_plan")
             if (pl and pl.get("join") is not None
