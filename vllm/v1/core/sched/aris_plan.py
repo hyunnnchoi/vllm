@@ -16,6 +16,10 @@ counted the same way). Due requests enter the waiting queue in "ord" order. When
 nothing runs or waits and no held request is due, the held requests with the
 smallest due step are released (event ff), as an idle engine takes no steps.
 
+Optional "arr0"/"off0": the call's arrival step in the record run (its admission
+"arr"/"off" can be later when it waited for KV space); when the arrival step is
+reached the event parr is logged once (TTFT is counted from there).
+
 "join" (variant A): a request restored from the CPU tier leaves
 WAITING_FOR_REMOTE_KVS only "join" forward steps after its load was admitted;
 when that step is reached and its load has not finished, schedule() schedules
@@ -76,15 +80,17 @@ class PlanState:
             self.held.remove(request)
 
     # gate -------------------------------------------------------------------
-    def _due_step(self, request) -> int | None:
+    def _due_step(self, request, arr="arr", off="off") -> int | None:
         """Relative step from which the request may run, None while its prev runs."""
         pl = _params(request)["aris_plan"]
-        due = int(pl["arr"])
+        if arr not in pl:
+            return None
+        due = int(pl[arr])
         prev = pl.get("prev")
         if prev is not None:
             if prev not in self.fin:
                 return None
-            due = max(due, self.fin[prev] + int(pl.get("off", 0)))
+            due = max(due, self.fin[prev] + int(pl.get(off, 0)))
         return due
 
     def release(self, sched) -> None:
@@ -98,6 +104,12 @@ class PlanState:
             self.go_fsid = self.fsid
             loop_log.log("go", time.time(), fsid=self.fsid, held=len(self.held))
         rel = self.rel()
+        for r in self.held:   # arrival (record run) reached: log once
+            if not getattr(r, "_aris_arrived", False):
+                a0 = self._due_step(r, "arr0", "off0")
+                if a0 is not None and a0 <= rel:
+                    r._aris_arrived = True
+                    loop_log.log("parr", time.time(), key=_params(r)["aris_key"], fsid=self.fsid, rel=rel)
         steps = {id(r): self._due_step(r) for r in self.held}
         due = [r for r in self.held if steps[id(r)] is not None and steps[id(r)] <= rel]
         idle = not (sched.running or sched.waiting or sched.skipped_waiting)
