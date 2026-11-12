@@ -154,6 +154,8 @@ class Transfer:
     is_src_access_order_any: bool = False
     t_submit: float = 0.0
     t_ret: float = 0.0
+    # VLLM_ARIS_TRACE: engine batch id (sid) of the worker call that submitted the copy
+    bid: int = -1
     # wall-clock times when the monitor thread first saw start/end complete
     t_start_seen: float = 0.0
     t_end_seen: float = 0.0
@@ -1175,7 +1177,7 @@ class SingleDirectionOffloadingHandler:
         num_dst_blocks = len(dst_blocks)
         xdir = "d2h" if self.gpu_to_cpu else "h2d"
         if _nvtx.ON:
-            torch.cuda.nvtx.range_push(f"kv_prepare {xdir} job={job_id} blocks={num_dst_blocks}")
+            torch.cuda.nvtx.range_push(f"kv_prepare {xdir} job={job_id} blocks={num_dst_blocks} B={_nvtx.cur_bid()}")
 
         # There are 2 types of transfers:
         # 1. GPU -> CPU
@@ -1318,6 +1320,9 @@ class SingleDirectionOffloadingHandler:
         cur_stream = current_platform.current_stream()
         if self.gpu_to_cpu or "w" not in _io_flags.flags():
             stream.wait_stream(cur_stream)
+            if _nvtx.TRACE and not self.gpu_to_cpu:
+                _nvtx.mark(f"restore_fence J={job_id} B={_nvtx.cur_bid()} stream={stream.stream_id} "
+                           f"src_stream={cur_stream.stream_id}")
         # E2: decide here whether this load is a staged SRPT job. Any other load that comes while staged SRPT work
         # exists (a fallback in that mode, or any load after the control changed) is ordered after every staged half:
         # the queued staged jobs are submitted first (so no end event is waited on before it is recorded), and the
@@ -1452,7 +1457,8 @@ class SingleDirectionOffloadingHandler:
             elif op_idx > 0 and not paced:
                 if _nvtx.ON:
                     torch.cuda.nvtx.range_push(
-                        f"kv_submit {xdir} job={job_id} ops={op_idx} bytes={num_transfer_bytes} mode={mode}")
+                        f"kv_submit {xdir} job={job_id} ops={op_idx} bytes={num_transfer_bytes} mode={mode} "
+                        f"B={_nvtx.cur_bid()} stream={stream.stream_id}")
                 plan = splan if mode == "stage" else (
                     _pitched_plan(all_src[:op_idx], all_dst[:op_idx], all_sizes[:op_idx], num_dst_blocks)
                     if (_PITCHED or mode == "strata") and not self.gpu_to_cpu and not _COALESCE
@@ -1547,6 +1553,7 @@ class SingleDirectionOffloadingHandler:
                 is_src_access_order_any=is_src_access_order_any,
                 t_submit=t_call,
                 t_ret=t_ret,
+                bid=_nvtx.cur_bid(),
                 layer_groups=layer_groups if lw_async and layer_groups else None,
                 layer_events={} if lw_async and layer_groups else None,
                 path=pitched_path or "sm" if route_sm else pitched_path or ("ipc" if use_ipc else ("autosm" if auto_sm else (
@@ -2055,6 +2062,8 @@ class SingleDirectionOffloadingHandler:
                 done.append(self._transfers.popleft())
         for transfer in done:
             LW_JOBS.pop(transfer.job_id, None)
+            if _nvtx.TRACE and not self.gpu_to_cpu:
+                _nvtx.mark(f"restore_complete_report J={transfer.job_id} B={_nvtx.cur_bid()} issue_B={transfer.bid}")
             if self._verify_n and not self.gpu_to_cpu:
                 self._verify_last = _verify_load(transfer, self._verify_n)
             ipc_times = None
@@ -2088,14 +2097,14 @@ class SingleDirectionOffloadingHandler:
                     '"t_ret":%.6f,"g_start":%.6f,"g_end":%.6f,"t_detect":%.6f,"pid":%d,'
                     '"wait_unsubmitted":%d,"wait_drains":%d,"q_inflight_max":%d,'
                     '"verify_n":%d,"verify_bad":%d,"evq_hook":%d,"evq_fallback":%d,"ops_raw":%d,'
-                    '"pump_max_ms":%.3f,"pump_sum_ms":%.3f,"stage_fallback":%d}\n'
+                    '"pump_max_ms":%.3f,"pump_sum_ms":%.3f,"stage_fallback":%d,"bid":%d,"bid_detect":%d}\n'
                     % (self._xfer_dir, transfer.job_id, transfer.num_bytes,
                        transfer.num_ops, transfer.path or self._mode()[0], transfer.t_submit,
                        transfer.t_ret, g_start, g_end, time.time(),
                        os.getpid(), self._wait_unsubmitted, self._wait_drains,
                        self._q_inflight_max, *self._verify_last, transfer.evq_hook, transfer.evq_fallback,
                        transfer.ops_raw or transfer.num_ops, transfer.pump_max_ms, transfer.pump_sum_ms,
-                       self._sq_fallback)
+                       self._sq_fallback, transfer.bid, _nvtx.cur_bid())
                 )
             j = transfer.stage_job
             if self._sq_dbg is not None and j is not None:

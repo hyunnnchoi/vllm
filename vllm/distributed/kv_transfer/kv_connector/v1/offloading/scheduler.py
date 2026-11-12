@@ -33,6 +33,7 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 from vllm.v1.engine import loop_log as _loop_log
+from vllm.v1.worker import aris_nvtx as _nvtx
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
@@ -1220,6 +1221,9 @@ class OffloadingConnectorScheduler:
                 req=request.request_id,
                 blk=len(dst_block_ids),
             )
+        if _nvtx.TRACE:
+            _nvtx.mark(f"restore_plan J={load_job_id} R={request.request_id} blk={len(dst_block_ids)} "
+                       f"B={_loop_log.SID}")
         # a load can only be issued when no other jobs are pending.
         assert not req_status.transfer_jobs
         req_status.transfer_jobs.add(load_job_id)

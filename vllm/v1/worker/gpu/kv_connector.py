@@ -22,6 +22,8 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 
+from vllm.v1.worker import aris_nvtx as _nvtx
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -89,11 +91,12 @@ class ActiveKVConnector(KVConnector):
         assert load_kwargs is not None
         self._pending_load_kwargs = None
         # TODO: sort out KV Connectors' use of forward_context
-        if is_forward_context_available():
-            self.kv_connector.start_load_kv(get_forward_context(), **load_kwargs)
-        else:
-            with set_forward_context(None, self.vllm_config):
+        with _nvtx.r("start_load_kv", _nvtx.cur_bid()):
+            if is_forward_context_available():
                 self.kv_connector.start_load_kv(get_forward_context(), **load_kwargs)
+            else:
+                with set_forward_context(None, self.vllm_config):
+                    self.kv_connector.start_load_kv(get_forward_context(), **load_kwargs)
 
     def finish_forward(self) -> None:
         if not self._disabled:
@@ -107,7 +110,12 @@ class ActiveKVConnector(KVConnector):
     ) -> KVConnectorOutput | None:
         if self._disabled:
             return None
+        with _nvtx.r("post_forward", _nvtx.cur_bid()):
+            return self._post_forward(finished_req_ids, wait_for_save)
 
+    def _post_forward(
+        self, finished_req_ids: set[str], wait_for_save: bool
+    ) -> KVConnectorOutput | None:
         if self._pending_load_kwargs is not None:
             self._start_load_kv()
 

@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadat
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.cpu import io_flags as _io_flags
+from vllm.v1.worker import aris_nvtx as _nvtx
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsManager,
 )
@@ -3045,6 +3046,8 @@ class Scheduler(SchedulerInterface):
                 return False
             self._aris.on_join(request)
             self._update_waiting_for_remote_kv(request)
+            if _nvtx.TRACE:
+                _nvtx.mark(f"restore_promote R={request.request_id}")
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
             else:
@@ -3096,6 +3099,8 @@ class Scheduler(SchedulerInterface):
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
+                if _nvtx.TRACE:
+                    _nvtx.mark(f"restore_reflect R={req_id}")
             else:
                 assert RequestStatus.is_finished(req.status)
                 self._free_blocks(self.requests[req_id])

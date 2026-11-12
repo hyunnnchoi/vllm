@@ -73,6 +73,7 @@ from vllm.v1.engine import (
     UtilityResult,
 )
 from vllm.v1.engine import loop_log
+from vllm.v1.worker import aris_nvtx as _nvtx
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -215,6 +216,11 @@ class EngineCore:
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
+        if _nvtx.TRACE:
+            logger.info("aris_trace executor=%s pid=%d tid=%d thread=%s batch_queue_size=%d async_scheduling=%s",
+                        type(self.model_executor).__name__, os.getpid(), threading.get_native_id(),
+                        threading.current_thread().name, self.batch_queue_size,
+                        vllm_config.scheduler_config.async_scheduling)
 
         self.is_ec_consumer = (
             vllm_config.ec_transfer_config is None
@@ -690,9 +696,14 @@ class EngineCore:
         if self.scheduler.has_requests():
             _t0 = time.time()
             _sid = loop_log.next_sid() if loop_log.enabled() else -1
-            scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            _b = _sid if _sid >= 0 else (_nvtx.next_bid() if _nvtx.TRACE else -1)
+            with _nvtx.r("schedule", _b):
+                scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
             _t1 = time.time()
-            with self.log_error_detail(scheduler_output):
+            scheduler_output._aris_bid = _b
+            if _nvtx.TRACE and scheduler_output.scheduled_new_reqs:
+                _nvtx.mark(f"new_reqs B={_b} ids={','.join(r.req_id for r in scheduler_output.scheduled_new_reqs[:8])}")
+            with self.log_error_detail(scheduler_output), _nvtx.r("dispatch", _b):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
@@ -722,9 +733,10 @@ class EngineCore:
                     grammar_output = self.scheduler.get_grammar_bitmask(
                         scheduler_output
                     )
-                    future = self.model_executor.sample_tokens(
-                        grammar_output, non_block=True
-                    )
+                    with _nvtx.r("sample_dispatch", _b):
+                        future = self.model_executor.sample_tokens(
+                            grammar_output, non_block=True
+                        )
                 else:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
@@ -748,12 +760,14 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output, exec_model_fut = batch_queue.pop()
+        _ob = getattr(scheduler_output, "_aris_bid", -1)
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
         ):
             _t0 = time.time()
-            model_output = future.result()
+            with _nvtx.r("output_wait owner", _ob):
+                model_output = future.result()
             if loop_log.keep(scheduler_output):
                 loop_log.log("wait", _t0, time.time())
             if model_output is None:
@@ -766,9 +780,10 @@ class EngineCore:
         # during the model execution.
         self._process_aborts_queue()
         _t0 = time.time()
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
-        )
+        with _nvtx.r("scheduler_update owner", _ob):
+            engine_core_outputs = self.scheduler.update_from_output(
+                scheduler_output, model_output
+            )
         if loop_log.enabled() and loop_log.keep(scheduler_output):
             outs = [o for eco in engine_core_outputs.values() for o in eco.outputs]
             fin_ids = [o.request_id for o in outs if o.finish_reason is not None]
@@ -804,7 +819,8 @@ class EngineCore:
             grammar_output = self.scheduler.get_grammar_bitmask(
                 deferred_scheduler_output
             )
-            future = self.model_executor.sample_tokens(grammar_output, non_block=True)
+            with _nvtx.r("sample_dispatch", getattr(deferred_scheduler_output, "_aris_bid", -1)):
+                future = self.model_executor.sample_tokens(grammar_output, non_block=True)
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 
         return engine_core_outputs, model_executed
