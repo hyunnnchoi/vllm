@@ -28,6 +28,7 @@ _step = itertools.count()
 _bid = itertools.count()
 _cur = {"step": -1, "bid": -1}
 _NULL = contextlib.nullcontext()
+_compiling = getattr(getattr(torch, "compiler", None), "is_compiling", lambda: False)   # dynamo tracing: no wrappers
 
 
 def next_bid() -> int:
@@ -76,6 +77,8 @@ def _wrap_copies() -> None:
         return dst_cuda != src_cuda and 0 < nbytes <= SMALL and not torch.cuda.is_current_stream_capturing()
 
     def copy_nvtx(self, src, *args, **kwargs):
+        if _compiling():
+            return copy_(self, src, *args, **kwargs)
         if isinstance(src, torch.Tensor) and small_xfer(self.is_cuda, src.is_cuda, self.nbytes):
             with rng(f"critical_copy {'h2d' if self.is_cuda else 'd2h'} {self.nbytes} {_caller()} step={_cur['step']} "
                      f"B={_cur['bid']}"):
@@ -83,6 +86,8 @@ def _wrap_copies() -> None:
         return copy_(self, src, *args, **kwargs)
 
     def to_nvtx(self, *args, **kwargs):
+        if _compiling():
+            return to(self, *args, **kwargs)
         dev = kwargs.get("device", args[0] if args else None)
         if isinstance(dev, (str, torch.device)) and self.nbytes <= SMALL:
             d_cuda = torch.device(dev).type == "cuda"
@@ -93,6 +98,8 @@ def _wrap_copies() -> None:
         return to(self, *args, **kwargs)
 
     def cpu_nvtx(self, *args, **kwargs):
+        if _compiling():
+            return cpu(self, *args, **kwargs)
         if small_xfer(False, self.is_cuda, self.nbytes):
             with rng(f"critical_copy d2h {self.nbytes} {_caller()} step={_cur['step']} B={_cur['bid']}"):
                 return cpu(self, *args, **kwargs)
@@ -106,7 +113,7 @@ def _wrap_copies() -> None:
     pool_copy = bu.UvaBufferPool.copy_to_gpu
 
     def copy_to_gpu_nvtx(self, x, out=None):
-        if torch.cuda.is_current_stream_capturing():
+        if _compiling() or torch.cuda.is_current_stream_capturing():
             return pool_copy(self, x, out)
         n = x.nbytes if hasattr(x, "nbytes") else len(x) * 4
         with rng(f"critical_copy h2d {n} uva_pool:{_caller()} step={_cur['step']} B={_cur['bid']}"):
