@@ -31,6 +31,14 @@ _NULL = contextlib.nullcontext()
 _compiling = getattr(getattr(torch, "compiler", None), "is_compiling", lambda: False)   # dynamo tracing: no wrappers
 
 
+def _nbytes(t) -> int:
+    """nbytes of a real tensor; -1 for fake / symbolic tensors (Inductor compiles through these wrappers)."""
+    try:
+        return int(t.nbytes)
+    except Exception:
+        return -1
+
+
 def next_bid() -> int:
     return next(_bid)
 
@@ -79,7 +87,7 @@ def _wrap_copies() -> None:
     def copy_nvtx(self, src, *args, **kwargs):
         if _compiling():
             return copy_(self, src, *args, **kwargs)
-        if isinstance(src, torch.Tensor) and small_xfer(self.is_cuda, src.is_cuda, self.nbytes):
+        if isinstance(src, torch.Tensor) and small_xfer(self.is_cuda, src.is_cuda, _nbytes(self)):
             with rng(f"critical_copy {'h2d' if self.is_cuda else 'd2h'} {self.nbytes} {_caller()} step={_cur['step']} "
                      f"B={_cur['bid']}"):
                 return copy_(self, src, *args, **kwargs)
@@ -89,7 +97,7 @@ def _wrap_copies() -> None:
         if _compiling():
             return to(self, *args, **kwargs)
         dev = kwargs.get("device", args[0] if args else None)
-        if isinstance(dev, (str, torch.device)) and self.nbytes <= SMALL:
+        if isinstance(dev, (str, torch.device)) and 0 < _nbytes(self) <= SMALL:
             d_cuda = torch.device(dev).type == "cuda"
             if small_xfer(d_cuda, self.is_cuda, self.nbytes):
                 with rng(f"critical_copy {'h2d' if d_cuda else 'd2h'} {self.nbytes} {_caller()} step={_cur['step']} "
@@ -100,7 +108,7 @@ def _wrap_copies() -> None:
     def cpu_nvtx(self, *args, **kwargs):
         if _compiling():
             return cpu(self, *args, **kwargs)
-        if small_xfer(False, self.is_cuda, self.nbytes):
+        if small_xfer(False, self.is_cuda, _nbytes(self)):
             with rng(f"critical_copy d2h {self.nbytes} {_caller()} step={_cur['step']} B={_cur['bid']}"):
                 return cpu(self, *args, **kwargs)
         return cpu(self, *args, **kwargs)
