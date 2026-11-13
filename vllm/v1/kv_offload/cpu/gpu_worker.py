@@ -930,9 +930,12 @@ class SingleDirectionOffloadingHandler:
         # refills the queue every 0.5 ms instead of once per engine step;
         # 's' = shortest remaining load first (preemptive at chunk
         # boundaries), loads no longer wait for the previous load, and
-        # finished loads are reported out of order.
+        # finished loads are reported out of order; 'b' (218) = only the pump
+        # thread submits, and it holds self._lock only to pick and record a
+        # chunk, not during the driver call (implies 't').
         self._q_thread = False
         self._q_srpt = False
+        self._q_bgonly = False
         # wait() checks (logged per transfer in VLLM_KV_GPU_LOG): calls that found
         # unsubmitted loads (the old wait() force-submitted all of them past the
         # queue cap), calls that had to submit a requested load, and the largest
@@ -1607,7 +1610,9 @@ class SingleDirectionOffloadingHandler:
             try:
                 if not self.gpu_to_cpu:
                     mode = self._mode()[0]
-                    if mode == "queue" and self._q_thread:
+                    if mode == "queue" and self._q_bgonly:
+                        self._pump_queue_bg()
+                    elif mode == "queue" and self._q_thread:
                         with self._lock:
                             self._pump_queue()
                     if LAYERWISE_ASYNC:
@@ -1713,6 +1718,7 @@ class SingleDirectionOffloadingHandler:
             if self._auto_on:
                 self._q_cap, self._q_chunk = 16384, 4096
                 self._q_dma, self._q_route, self._q_thread, self._q_srpt = True, False, False, True
+                self._q_bgonly = False
                 self._q_pitched = self._q_order = False
                 return "queue", self._q_cap
             if raw.startswith("ctrlq:"):
@@ -1724,7 +1730,8 @@ class SingleDirectionOffloadingHandler:
                 self._q_route = "B" in flags
                 if self._q_route and len(parts) >= 6:
                     self._q_route_pwj = tuple(int(x) for x in parts[3:6])
-                self._q_thread = "t" in flags
+                self._q_bgonly = "b" in flags
+                self._q_thread = "t" in flags or self._q_bgonly
                 self._q_srpt = "s" in flags
                 self._q_pitched = "p" in flags
                 self._q_order = "o" in flags
@@ -1873,7 +1880,8 @@ class SingleDirectionOffloadingHandler:
         everything that is left (used by wait() and shutdown())."""
         mode = self._mode()[0]
         if not force and mode == "queue":
-            self._pump_queue()
+            if not self._q_bgonly:
+                self._pump_queue()
             return
         if not force and mode == "evq":
             self._pump_evq(None)
@@ -2012,6 +2020,68 @@ class SingleDirectionOffloadingHandler:
             in_flight += n
             self._q_inflight_max = max(self._q_inflight_max, in_flight)
 
+    def _pump_queue_bg(self) -> None:
+        """'b' flag: the pump thread is the only submitter. self._lock is held
+        only to pick a chunk (and order it after the previous load) and to
+        record it, so an engine-thread get_finished() never waits for a
+        cuMemcpyBatchAsync call."""
+        while True:
+            with self._lock:
+                while self._q_chunks and self._q_chunks[0][0].query():
+                    self._q_chunks.popleft()
+                in_flight = sum(n for _, n in self._q_chunks)
+                cands = [t for t in self._transfers if not t.submitted and t.stage_job is None]
+                if not cands:
+                    return
+                pending = min(cands, key=lambda t: t.num_ops - t.next_op) if self._q_srpt else cands[0]
+                if pending.pitched is not None:
+                    self._pump_queue()
+                    return
+                start = pending.next_op
+                n = min(self._q_chunk, pending.num_ops - start)
+                if in_flight + n > self._q_cap and in_flight > 0:
+                    return
+                end = start + n
+                if start == 0 and not self._q_srpt:
+                    prev = None
+                    for t in self._transfers:
+                        if t is pending:
+                            break
+                        prev = t
+                    if prev is not None:
+                        pending.stream.wait_event(prev.end_event)
+                pending.next_op = end
+                last = end >= pending.num_ops
+            ev = pending.end_event if last else torch.Event()
+            t_pump = time.perf_counter()
+            with current_platform.stream(pending.stream):
+                if _nvtx.ON:
+                    torch.cuda.nvtx.range_push(
+                        f"kv_submit_chunk job={pending.job_id} ops={start}:{end} inflight={in_flight} queue")
+                (ops.swap_blocks_batch if self._q_dma else self._swap_blocks_batch)(
+                    pending.batch_src[start:end],
+                    pending.batch_dst[start:end],
+                    pending.batch_sizes[start:end],
+                    is_src_access_order_any=pending.is_src_access_order_any,
+                )
+                if _nvtx.ON:
+                    torch.cuda.nvtx.range_pop()
+                ev.record(pending.stream)
+            dt = (time.perf_counter() - t_pump) * 1e3
+            with self._lock:
+                pending.pump_max_ms = max(pending.pump_max_ms, dt)
+                pending.pump_sum_ms += dt
+                if last:
+                    pending.submitted = True
+                self._q_chunks.append((ev, n))
+                self._q_inflight_max = max(self._q_inflight_max, in_flight + n)
+
+    def _wait_bg_submitted(self, transfers: list) -> None:
+        """'b' flag: the engine thread never submits; wait (without self._lock)
+        until the pump thread has submitted these loads."""
+        while any(not t.submitted for t in transfers):
+            time.sleep(0.0002)
+
     def get_finished(self) -> list[TransferResult]:
         with self._lock:
             return self._get_finished_locked()
@@ -2141,6 +2211,7 @@ class SingleDirectionOffloadingHandler:
         """Block until the given jobs finish. Only this handler's requested jobs
         are submitted; other pending loads keep their pacing and queue cap (a
         store flush used to force-submit every pending load)."""
+        bg_wait: list = []
         with self._lock:
             if any(not t.submitted for t in self._transfers):
                 self._wait_unsubmitted += 1
@@ -2150,10 +2221,13 @@ class SingleDirectionOffloadingHandler:
                 if any(t.stage_job is not None for t in needed):
                     self._pump_stage(force=True)   # E2: the end events are recorded only by the last half
                 needed = [t for t in needed if not t.submitted]
-                if needed and self._mode()[0] == "queue":
+                if needed and self._mode()[0] == "queue" and self._q_bgonly:
+                    bg_wait = needed
+                elif needed and self._mode()[0] == "queue":
                     self._drain_queue_bounded(needed)
                 elif needed:
                     self._pump(force=True)
+        self._wait_bg_submitted(bg_wait)
         for job_id in job_ids:
             event = self._transfer_events.get(job_id)
             if event is not None:
@@ -2173,6 +2247,10 @@ class SingleDirectionOffloadingHandler:
         """Drain this direction and release its transfer-side resources."""
         if self._ipc is not None:
             self._ipc.close()
+        if self._q_bgonly and self._bg is not None:
+            with self._lock:
+                unsubmitted = [t for t in self._transfers if not t.submitted]
+            self._wait_bg_submitted(unsubmitted)
         with self._lock:
             if self._sq.pending():
                 self._pump_stage(force=True)
