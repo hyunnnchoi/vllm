@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import os
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -231,7 +232,10 @@ class RequestState:
         stream_interval: int,
     ) -> "RequestState":
         if sampling_params := request.sampling_params:
-            if not sampling_params.detokenize:
+            # aris 223: VLLM_ARIS_NO_DETOK=1 turns output detokenization off for every request (timing runs whose
+            # output tokens are wrong on purpose, i.e. the "ideal" restore control; the completions API has no
+            # per-request switch). Output text is then empty; token ids and timing are unchanged.
+            if not sampling_params.detokenize or os.environ.get("VLLM_ARIS_NO_DETOK") == "1":
                 tokenizer = None
             output_kind = sampling_params.output_kind
             if sampling_params.stream_interval is not None:
