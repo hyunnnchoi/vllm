@@ -385,7 +385,18 @@ def _coalesce_descriptors(src: np.ndarray, dst: np.ndarray, sizes: np.ndarray, n
 # aris experiment 130 (VLLM_KV_PITCHED=1): a CPU->GPU load whose copies are all layers of each block, with constant
 # per-layer pitches on both sides, goes as one pitched 2D copy per block (width = page, height = layers). Block ids
 # need not be contiguous (9-25 Idea 1; A100 pilot P5: 98% of a flat copy with 1/L of the descriptors).
-_PITCHED = os.environ.get("VLLM_KV_PITCHED", "0") == "1"
+_PITCHED = os.environ.get("VLLM_KV_PITCHED", "0") in ("1", "3")
+# aris experiment 224 (VLLM_KV_PITCHED=3): the same per-block 2D copies, submitted as one cuMemcpy3DBatchAsync call
+# per load (depth 1), so that a load reaches the driver in one batch call as in stock vLLM, with 1/L of the copies.
+_PITCHED_BATCH = os.environ.get("VLLM_KV_PITCHED", "0") == "3"
+_CUDRV = None
+# CUDA_MEMCPY3D_BATCH_OP (cuda.h 13): two 40-byte operands {type, ptr, rowLength, layerHeight, locHint{type, id}},
+# extent {width, height, depth}, srcAccessOrder, flags = 112 bytes (layout checked in exp 130, cs130_contend2.py)
+_OP3D = np.dtype({"names": ["st", "sp", "srow", "slay", "sloc", "sid", "dt", "dp", "drow", "dlay", "dloc", "did",
+                            "w", "h", "d", "order", "flags"],
+                  "formats": ["<i4", "<u8", "<u8", "<u8", "<i4", "<i4", "<i4", "<u8", "<u8", "<u8", "<i4", "<i4",
+                              "<u8", "<u8", "<u8", "<i4", "<u4"],
+                  "offsets": [0, 8, 16, 24, 32, 36, 40, 48, 56, 64, 72, 76, 80, 88, 96, 104, 108], "itemsize": 112})
 _CUDART = None
 
 
@@ -440,6 +451,35 @@ def _pitched_copies(src: torch.Tensor, dst: torch.Tensor, plan, n_blocks: int, s
         rc = f(int(d0[i]), dp, int(s0[i]), sp, page, n_layers, 4, h)   # 4 = cudaMemcpyDefault
         if rc:
             raise RuntimeError(f"cudaMemcpy2DAsync failed ({rc}) at block {i}")
+
+
+def _pitched_ops3d(s0: np.ndarray, d0: np.ndarray, plan) -> np.ndarray:
+    """One CUDA_MEMCPY3D_BATCH_OP per block: width = page, height = layers, depth 1, pitches of the plan."""
+    n_layers, page, sp, dp = plan
+    a = np.zeros(len(s0), dtype=_OP3D)
+    a["st"] = a["dt"] = 1                  # CU_MEMCPY_OPERAND_TYPE_POINTER
+    a["sp"], a["dp"] = s0, d0
+    a["srow"], a["drow"] = sp, dp
+    a["slay"] = a["dlay"] = n_layers
+    a["sloc"], a["dloc"] = 2, 1            # locHint host / device (ignored for pinned and device memory)
+    a["w"], a["h"], a["d"] = page, n_layers, 1
+    a["order"] = 3                         # CU_MEMCPY_SRC_ACCESS_ORDER_ANY, as stock loads
+    return a
+
+
+def _pitched_batch3d(src: torch.Tensor, dst: torch.Tensor, plan, n_blocks: int, stream) -> None:
+    """All blocks of a load (as _pitched_copies) in one cuMemcpy3DBatchAsync call."""
+    global _CUDRV
+    if _CUDRV is None:
+        import ctypes
+        lib = ctypes.CDLL("libcuda.so.1")
+        lib.cuMemcpy3DBatchAsync_v2.argtypes = [ctypes.c_size_t, ctypes.c_void_p, ctypes.c_ulonglong, ctypes.c_void_p]
+        lib.cuMemcpy3DBatchAsync_v2.restype = ctypes.c_int
+        _CUDRV = lib
+    ops_ = _pitched_ops3d(src[:n_blocks].numpy().astype(np.uint64), dst[:n_blocks].numpy().astype(np.uint64), plan)
+    rc = _CUDRV.cuMemcpy3DBatchAsync_v2(len(ops_), ops_.ctypes.data, 0, stream.cuda_stream)
+    if rc:
+        raise RuntimeError(f"cuMemcpy3DBatchAsync failed ({rc}) for {n_blocks} blocks")
 
 
 # aris experiment 132 (control "ctrlstage:<B>:<P>[:<W>:<J>]", or "stage:..." without the SM control path): a CPU->GPU
@@ -1516,6 +1556,9 @@ class SingleDirectionOffloadingHandler:
                                                      self._stage_J, stage_keep)
                         pitched_path = "stage:%d:%d" % (n_half, n_dma)
                         self._sq.fence(end_event)   # its scatters hold both slots until its end event
+                elif plan is not None and _PITCHED_BATCH:
+                    _pitched_batch3d(src, dst, plan, num_dst_blocks, stream)
+                    pitched_path = "pitched3d:%d" % num_dst_blocks
                 elif plan is not None and _PITCHED:
                     _pitched_copies(src, dst, plan, num_dst_blocks, stream)
                     pitched_path = "pitched2d:%d" % num_dst_blocks
