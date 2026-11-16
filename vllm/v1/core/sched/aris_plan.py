@@ -24,6 +24,14 @@ reached the event parr is logged once (TTFT is counted from there).
 WAITING_FOR_REMOTE_KVS only "join" forward steps after its load was admitted;
 when that step is reached and its load has not finished, schedule() schedules
 nothing (barrier) until it has.
+
+"adm" (experiment 231, 2026-11-16): the plan's "arr" is the step at which the
+reference run admitted the request, so the request must be admitted by the
+schedule() call that releases it. Before scheduling anything, schedule() asks
+the connector whether the request's lookup is still pending (a store or load of
+its blocks is in flight); while it is, schedule() schedules nothing (event abar
+once per request, at most ADM_TIMEOUT s, then abto). A released "adm" request
+that is still not admitted when a non-empty step is built is logged once (amiss).
 """
 
 import os
@@ -32,6 +40,7 @@ import time
 from vllm.v1.engine import loop_log
 
 GO = os.environ.get("VLLM_ARIS_PLAN_GO") or None
+ADM_TIMEOUT = float(os.environ.get("VLLM_ARIS_ADM_TIMEOUT", "5"))
 
 
 def _params(request) -> dict:
@@ -45,6 +54,7 @@ class PlanState:
         self.held: list = []
         self.fin: dict[str, int] = {}
         self.n_ff = 0
+        self.strict: list = []   # released "adm" requests not admitted yet
 
     # bookkeeping ------------------------------------------------------------
     def rel(self) -> int:
@@ -62,7 +72,41 @@ class PlanState:
             return True
         return False
 
+    def on_admit(self, request) -> None:
+        if self.strict and request in self.strict:
+            self.strict.remove(request)
+
+    def adm_barrier(self, sched) -> bool:
+        """Experiment 231: a released "adm" request whose connector lookup is still pending."""
+        for r in self.strict:
+            if r.status.name != "WAITING" or r.num_computed_tokens:
+                continue
+            if getattr(r, "_aris_abto", False):
+                continue
+            if time.time() - r._aris_rel_t > ADM_TIMEOUT:
+                r._aris_abto = True
+                loop_log.log("abto", time.time(), key=_params(r)["aris_key"], fsid=self.fsid)
+                continue
+            if sched._aris_lookup_pending(r):
+                if not getattr(r, "_aris_ab", False):
+                    r._aris_ab = True
+                    loop_log.log("abar", time.time(), key=_params(r)["aris_key"], fsid=self.fsid)
+                time.sleep(0.0002)
+                return True
+        return False
+
+    def after_schedule(self, ntok: int) -> None:
+        """Experiment 231: log released "adm" requests that a non-empty step left unadmitted."""
+        if not ntok or not self.strict:
+            return
+        for r in self.strict:
+            if not getattr(r, "_aris_miss", False):
+                r._aris_miss = True
+                loop_log.log("amiss", time.time(), key=_params(r)["aris_key"], fsid=self.fsid,
+                             status=r.status.name)
+
     def on_load(self, request, ext_tokens: int | None = None) -> None:
+        self.on_admit(request)
         request._aris_adm = self.fsid
         key = _params(request).get("aris_key")
         if key is not None:
@@ -84,6 +128,7 @@ class PlanState:
     def drop(self, request) -> None:
         if request in self.held:
             self.held.remove(request)
+        self.on_admit(request)
 
     # gate -------------------------------------------------------------------
     def _due_step(self, request, arr="arr", off="off") -> int | None:
@@ -135,6 +180,9 @@ class PlanState:
         for r in due:
             self.held.remove(r)
             sched._enqueue_waiting_request(r)
+            if _params(r)["aris_plan"].get("adm"):
+                r._aris_rel_t = time.time()
+                self.strict.append(r)
             loop_log.log("rel", time.time(), key=_params(r)["aris_key"], fsid=self.fsid,
                          rel=rel)
 

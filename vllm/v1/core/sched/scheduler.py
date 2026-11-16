@@ -546,6 +546,16 @@ class Scheduler(SchedulerInterface):
         )
         return blocks, num_local, shared_prefix_boundary, False
 
+    def _aris_lookup_pending(self, request: Request) -> bool:
+        """aris experiment 231: would the connector defer this waiting request's lookup now?"""
+        if self.connector is None or request.num_computed_tokens:
+            return False
+        _, num_local, _, _ = self._get_local_prefix_cache_hit(request)
+        ext_tokens, _ = self.connector.get_num_new_matched_tokens(
+            request, num_local - num_local % self.block_size
+        )
+        return ext_tokens is None
+
     def _reserve_prefill_lookahead(
         self,
         request: Request,
@@ -597,6 +607,8 @@ class Scheduler(SchedulerInterface):
         # aris experiment 212: release due planned requests; variant A barrier
         self._aris.release(self)
         if self._aris.barrier(self):
+            token_budget = 0
+        elif self._aris.adm_barrier(self):   # aris experiment 231
             token_budget = 0
 
         # Encoder-related.
@@ -1305,6 +1317,7 @@ class Scheduler(SchedulerInterface):
                         )
                     continue
 
+                self._aris.on_admit(request)   # aris experiment 231
                 self.running.append(request)
                 if num_external_computed_tokens > 0:
                     # load_kv_async is False here
@@ -1520,6 +1533,7 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        self._aris.after_schedule(total_num_scheduled_tokens)   # aris experiment 231
         if total_num_scheduled_tokens > 0:
             self._aris.fsid += 1
         return scheduler_output
