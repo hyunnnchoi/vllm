@@ -37,7 +37,7 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 logger = init_logger(__name__)
 
 MAX_BYTES = 4 << 20   # only control-sized copies
-BLOCK = 4096
+BLOCK = int(os.environ.get("VLLM_CTRL_UVA_BLOCK", "4096") or 4096)
 
 _ENV_ON = os.environ.get("VLLM_CTRL_UVA", "0") == "1"
 # aris 236: VLLM_CTRL_UVA_SCOPE=path selects the copies by the path that issues them instead of by their properties.
@@ -48,6 +48,14 @@ _ENV_ON = os.environ.get("VLLM_CTRL_UVA", "0") == "1"
 # is counted (up_dma / down_dma / tab_dma).
 _SCOPE_PATH = os.environ.get("VLLM_CTRL_UVA_SCOPE", "") == "path"
 _path_n = {"up": 0, "up_dma": 0, "down": 0, "down_dma": 0, "tab": 0, "tab_dma": 0}
+# aris 237: VLLM_CTRL_UVA_PROGS=<N> (N > 0) runs a step copy as ONE launch of N programs; each program walks over the
+# copy in BLOCK-byte pieces (program p takes pieces p, p + N, ...). N = 1 is one program, i.e., one SM, whatever the
+# size. 0 (default) keeps one program per BLOCK bytes. The staged load's destination-table upload (path scope) is
+# hundreds of KB, so it keeps one program per BLOCK bytes unless VLLM_CTRL_UVA_TAB_PROGS=<M> (M > 0) is given
+# (exp 235 part 2: 403 KB takes 113 us with one program and 13 us with one program per 4 KB).
+# VLLM_CTRL_UVA_BLOCK=<bytes> sets the piece size (default 4096).
+_PROGS = int(os.environ.get("VLLM_CTRL_UVA_PROGS", "0") or 0)
+_TAB_PROGS = int(os.environ.get("VLLM_CTRL_UVA_TAB_PROGS", "0") or 0)
 _FILE = os.environ.get("VLLM_KV_LOAD_PACE_FILE") or None
 _state = {"on": False, "checked": 0.0, "mtime": -1.0, "n": 0}
 _orig_copy = None
@@ -149,6 +157,23 @@ if HAS_TRITON:
         tl.store(dst + offs, tl.load(src + offs, mask=m), mask=m)
 
 
+if HAS_TRITON:
+
+    @triton.jit(do_not_specialize=["src_addr", "dst_addr", "nbytes"])
+    def _uva_copy_loop(src_addr, dst_addr, nbytes, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        nprog = tl.num_programs(0)
+        cols = tl.arange(0, BLOCK)
+        src = src_addr.to(tl.pointer_type(tl.uint8))
+        dst = dst_addr.to(tl.pointer_type(tl.uint8))
+        start = pid * BLOCK
+        while start < nbytes:
+            offs = start + cols
+            m = offs < nbytes
+            tl.store(dst + offs, tl.load(src + offs, mask=m), mask=m)
+            start += nprog * BLOCK
+
+
 def _enabled() -> bool:
     if _ENV_ON:
         return True
@@ -178,10 +203,14 @@ def _small(t: torch.Tensor) -> bool:
     return 0 < nbytes <= MAX_BYTES and t.is_contiguous()
 
 
-def _launch(dst: torch.Tensor, src: torch.Tensor) -> None:
+def _launch(dst: torch.Tensor, src: torch.Tensor, progs: int | None = None) -> None:
     _tr["tl"].sm = True
     nbytes = dst.numel() * dst.element_size()
-    _uva_copy[(triton.cdiv(nbytes, BLOCK),)](src.data_ptr(), dst.data_ptr(), nbytes, BLOCK=BLOCK)
+    progs = _PROGS if progs is None else progs
+    if progs > 0:
+        _uva_copy_loop[(progs,)](src.data_ptr(), dst.data_ptr(), nbytes, BLOCK=BLOCK)
+    else:
+        _uva_copy[(triton.cdiv(nbytes, BLOCK),)](src.data_ptr(), dst.data_ptr(), nbytes, BLOCK=BLOCK)
     ev = torch.cuda.Event()
     ev.record()
     _pending.append((ev, src, dst))
@@ -257,7 +286,7 @@ def table_upload(dst: torch.Tensor, src: torch.Tensor) -> bool:
         if (src.device.type == "cpu" and src.is_pinned() and dst.is_cuda and dst.dtype == src.dtype
                 and dst.numel() == src.numel() and _flat_ok(src) and dst.is_contiguous()):
             with torch.cuda.device(dst.device):
-                _launch(dst, src)
+                _launch(dst, src, _TAB_PROGS)
             _path_n["tab"] += 1
             return True
     except Exception as e:
@@ -435,8 +464,8 @@ def install() -> None:
     _orig_copy = torch.Tensor.copy_
     _orig_to = torch.Tensor.to
     if _SCOPE_PATH:
-        logger.info("ctrl_uva installed with path scope (env=%s, control file=%s): Tensor.copy_/to unpatched",
-                    _ENV_ON, _FILE)
+        logger.info("ctrl_uva installed with path scope (env=%s, control file=%s, programs=%d, table programs=%d, "
+                    "piece=%d B): Tensor.copy_/to unpatched", _ENV_ON, _FILE, _PROGS, _TAB_PROGS, BLOCK)
         return
     if _TRACE is not None:
         _orig_cpu = torch.Tensor.cpu
