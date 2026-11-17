@@ -40,6 +40,14 @@ MAX_BYTES = 4 << 20   # only control-sized copies
 BLOCK = 4096
 
 _ENV_ON = os.environ.get("VLLM_CTRL_UVA", "0") == "1"
+# aris 236: VLLM_CTRL_UVA_SCOPE=path selects the copies by the path that issues them instead of by their properties.
+# Tensor.copy_ / Tensor.to are then left unpatched; the SM kernel is called from the three places that issue the
+# step path's copies and the staged restore's table: async_tensor_h2d (model inputs), async_copy_to_np (sampled
+# tokens) and the destination-table upload of a staged load. There is no size cap in this mode. A copy from one of
+# these places that the kernel cannot do (not pinned, not contiguous, dtype conversion) goes to the copy engine and
+# is counted (up_dma / down_dma / tab_dma).
+_SCOPE_PATH = os.environ.get("VLLM_CTRL_UVA_SCOPE", "") == "path"
+_path_n = {"up": 0, "up_dma": 0, "down": 0, "down_dma": 0, "tab": 0, "tab_dma": 0}
 _FILE = os.environ.get("VLLM_KV_LOAD_PACE_FILE") or None
 _state = {"on": False, "checked": 0.0, "mtime": -1.0, "n": 0}
 _orig_copy = None
@@ -181,7 +189,85 @@ def _launch(dst: torch.Tensor, src: torch.Tensor) -> None:
         _pending.popleft()
     _state["n"] += 1
     if _state["n"] in (1, 1000) or _state["n"] % 100000 == 0:
-        logger.info("ctrl_uva: %d control copies through the SM kernel", _state["n"])
+        logger.info("ctrl_uva: %d control copies through the SM kernel%s", _state["n"],
+                    f" (path scope: {_path_n})" if _SCOPE_PATH else "")
+
+
+def _path_on() -> bool:
+    return _SCOPE_PATH and HAS_TRITON and _enabled() and not torch.cuda.is_current_stream_capturing()
+
+
+def _flat_ok(t: torch.Tensor) -> bool:
+    return t.numel() > 0 and t.is_contiguous()
+
+
+def step_upload(t: torch.Tensor, out, device, dtype):
+    """Path scope: async_tensor_h2d's copy of the pinned CPU tensor t to `out` (or to a new tensor on `device`)
+    through the SM kernel. Returns the GPU tensor, or None when the caller has to use the copy engine."""
+    if not _path_on():
+        return None
+    try:
+        if t.is_pinned() and _flat_ok(t):
+            if out is not None:
+                if out.is_cuda and out.dtype == t.dtype and out.numel() == t.numel() and out.is_contiguous():
+                    with torch.cuda.device(out.device):
+                        _launch(out, t)
+                    _path_n["up"] += 1
+                    return out
+            elif dtype in (None, t.dtype):
+                dev = torch.device("cuda", device) if isinstance(device, int) else torch.device(device)
+                if dev.type == "cuda":
+                    if dev.index is None:
+                        dev = torch.device("cuda", torch.cuda.current_device())
+                    o = torch.empty(t.shape, dtype=t.dtype, device=dev)
+                    with torch.cuda.device(dev):
+                        _launch(o, t)
+                    _path_n["up"] += 1
+                    return o
+    except Exception as e:
+        logger.warning_once("ctrl_uva step_upload fallback: %s", e)
+    _path_n["up_dma"] += 1
+    return None
+
+
+def step_download(x: torch.Tensor):
+    """Path scope: async_copy_to_np's copy of the GPU tensor x to pinned CPU memory through the SM kernel.
+    Returns the CPU tensor, or None when the caller has to use the copy engine."""
+    if not _path_on():
+        return None
+    try:
+        if x.is_cuda and _flat_ok(x):
+            o = torch.empty(x.shape, dtype=x.dtype, device="cpu", pin_memory=True)
+            with torch.cuda.device(x.device):
+                _launch(o, x)
+            _path_n["down"] += 1
+            return o
+    except Exception as e:
+        logger.warning_once("ctrl_uva step_download fallback: %s", e)
+    _path_n["down_dma"] += 1
+    return None
+
+
+def table_upload(dst: torch.Tensor, src: torch.Tensor) -> bool:
+    """Path scope: a staged load's destination-table upload through the SM kernel, on the current stream.
+    Returns False when the caller has to use the copy engine (also when the path scope is off)."""
+    if not _path_on():
+        return False
+    try:
+        if (src.device.type == "cpu" and src.is_pinned() and dst.is_cuda and dst.dtype == src.dtype
+                and dst.numel() == src.numel() and _flat_ok(src) and dst.is_contiguous()):
+            with torch.cuda.device(dst.device):
+                _launch(dst, src)
+            _path_n["tab"] += 1
+            return True
+    except Exception as e:
+        logger.warning_once("ctrl_uva table_upload fallback: %s", e)
+    _path_n["tab_dma"] += 1
+    return False
+
+
+def path_counts() -> dict:
+    return dict(_path_n)
 
 
 def _copy_(self, src, non_blocking=False, *args, **kwargs):
@@ -348,6 +434,10 @@ def install() -> None:
         return
     _orig_copy = torch.Tensor.copy_
     _orig_to = torch.Tensor.to
+    if _SCOPE_PATH:
+        logger.info("ctrl_uva installed with path scope (env=%s, control file=%s): Tensor.copy_/to unpatched",
+                    _ENV_ON, _FILE)
+        return
     if _TRACE is not None:
         _orig_cpu = torch.Tensor.cpu
         torch.Tensor.copy_ = _copy_traced

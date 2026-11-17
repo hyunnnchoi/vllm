@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import os
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -19,6 +20,8 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.utils import raise_if_nan_logits
+
+_ARIS_UVA_PATH = os.environ.get("VLLM_CTRL_UVA_SCOPE", "") == "path"
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -251,6 +254,12 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
 
 
 def async_copy_to_np(x: torch.Tensor) -> np.ndarray:
+    if _ARIS_UVA_PATH:   # aris 236: step-path download through the SM kernel (ctrl_uva, path scope)
+        from vllm.v1.worker import ctrl_uva
+
+        r = ctrl_uva.step_download(x)
+        if r is not None:
+            return r.numpy()
     return x.to("cpu", non_blocking=True).numpy()
 
 

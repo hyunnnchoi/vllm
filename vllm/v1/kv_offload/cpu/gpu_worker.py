@@ -33,6 +33,7 @@ from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu import io_flags as _io_flags
 from vllm.v1.kv_offload.cpu import swap_blocks_triton as _sbt
 from vllm.v1.worker import aris_nvtx as _nvtx
+from vllm.v1.worker import ctrl_uva as _ctrl_uva
 from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
     THRESHOLD_BYTES,
     swap_blocks_batch,
@@ -533,7 +534,9 @@ def _staged_load(src_np: np.ndarray, dst_t: torch.Tensor, op_idx: int, n_blocks:
     base = stage_buf.data_ptr()
     stage64 = stage_buf.view(torch.int64)
     dst_tab = torch.empty(op_idx, dtype=torch.int64, device=stage_buf.device)
-    dst_tab.copy_(dst_t[:op_idx].view(torch.int64), non_blocking=True)   # on the transfer stream, first
+    _tab_src = dst_t[:op_idx].view(torch.int64)
+    if not _ctrl_uva.table_upload(dst_tab, _tab_src):   # aris 236: path scope; otherwise as before
+        dst_tab.copy_(_tab_src, non_blocking=True)   # on the transfer stream, first
     dst_tab.record_stream(scatter_stream)
     keep.append(dst_tab)
     rows = np.ascontiguousarray(src_np[:n_blocks]).astype(np.int64)
@@ -1538,7 +1541,9 @@ class SingleDirectionOffloadingHandler:
                         # E2: upload the destination table on the transfer stream and queue the job; the halves are
                         # submitted by _pump_stage (here once below, then the background thread)
                         dst_tab = torch.empty(op_idx, dtype=torch.int64, device=self._stage_buf.device)
-                        dst_tab.copy_(dst[:op_idx].view(torch.int64), non_blocking=True)
+                        _tab_src = dst[:op_idx].view(torch.int64)
+                        if not _ctrl_uva.table_upload(dst_tab, _tab_src):
+                            dst_tab.copy_(_tab_src, non_blocking=True)
                         dst_tab.record_stream(self._stage_stream)
                         ready = torch.Event(enable_timing=self._sq_dbg is not None)
                         ready.record(stream)

@@ -73,6 +73,7 @@ T = TypeVar("T")
 
 
 PIN_MEMORY = is_pin_memory_available()
+_ARIS_UVA_PATH = os.environ.get("VLLM_CTRL_UVA_SCOPE", "") == "path"
 
 
 def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
@@ -725,6 +726,12 @@ def async_tensor_h2d(
         t = torch.tensor(data, dtype=dtype, pin_memory=PIN_MEMORY, device="cpu")
     assert t.is_cpu
 
+    if _ARIS_UVA_PATH:   # aris 236: step-path upload through the SM kernel (ctrl_uva, path scope)
+        from vllm.v1.worker import ctrl_uva
+
+        r = ctrl_uva.step_upload(t, out, device, dtype)
+        if r is not None:
+            return r
     if out is not None:
         assert out.dtype == dtype
         return out.copy_(t, non_blocking=True)
