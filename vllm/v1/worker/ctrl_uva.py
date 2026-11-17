@@ -217,7 +217,7 @@ def _launch(dst: torch.Tensor, src: torch.Tensor, progs: int | None = None) -> N
     while _pending and _pending[0][0].query():
         _pending.popleft()
     _state["n"] += 1
-    if _state["n"] in (1, 1000) or _state["n"] % 100000 == 0:
+    if _state["n"] in (1, 1000) or _state["n"] % (10000 if _SCOPE_PATH else 100000) == 0:
         logger.info("ctrl_uva: %d control copies through the SM kernel%s", _state["n"],
                     f" (path scope: {_path_n})" if _SCOPE_PATH else "")
 
